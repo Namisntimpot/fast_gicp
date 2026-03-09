@@ -43,6 +43,10 @@ class CMakeBuild(build_ext):
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
         # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
         # from Python.
+
+        # if some dependencies are installed in conda env...
+        conda_prefix = os.environ.get("CONDA_PREFIX", None)
+
         cmake_args = [
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}".format(extdir),
             "-DPYTHON_EXECUTABLE={}".format(sys.executable),
@@ -50,7 +54,14 @@ class CMakeBuild(build_ext):
             "-DCMAKE_BUILD_TYPE={}".format(cfg),  # not used on MSVC, but no harm,
             # "-DBUILD_VGICP_CUDA=ON",
             "-DBUILD_PYTHON_BINDINGS=ON",
+            "-DBUILD_apps=OFF",
         ]
+        if conda_prefix is not None:
+            cmake_args += [
+                f"-DPCL_DIR={conda_prefix}/share/pcl-1.14",
+                f"-DBOOST_ROOT={conda_prefix}",
+                f"-Dpybind11_DIR={conda_prefix}/lib/python3.11/site-packages/pybind11/share/cmake/pybind11",
+            ]
         build_args = []
 
         if self.compiler.compiler_type != "msvc":

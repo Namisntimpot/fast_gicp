@@ -1,3 +1,8 @@
++ 抑制pcl的警告，不再频繁输出`fastgicp Assignment with new_width equal to 0,setting width to size of the cloud and height to 1`.
++ cmake中必须加 `-DBUILD_apps=OFF`，摆脱对visualization相关包的依赖。CMakeList.txt中，改为了`find_package(PCL REQUIRED COMPONENTS common io filters search registration)`  
++ 要手动安装pybinding11，没有用third_party里的那些, CMakeList里：`find_package(pybind11 CONFIG REQUIRED)`  
++ `setup.py` 中，如果你的系统依赖包不是装在conda环境，就注释掉`59-64`行.
+
 
 * Ref: https://github.com/SMRT-AIST/fast_gicp
 

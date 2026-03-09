@@ -8,7 +8,7 @@ option(BUILD_PYTHON_BINDINGS "Build python bindings" OFF)
 
 set(CMAKE_BUILD_TYPE "Release")
 
-find_package(PCL REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io filters search registration)
 find_package(Eigen3 REQUIRED)
 add_definitions(${PCL_DEFINITIONS})
 
@@ -91,7 +91,7 @@ endif()
 
 ### Python bindings ###
 if(BUILD_PYTHON_BINDINGS)
-  add_subdirectory(thirdparty/pybind11)
+  find_package(pybind11 CONFIG REQUIRED)
   pybind11_add_module(pygicp
     src/python/main.cpp
   )

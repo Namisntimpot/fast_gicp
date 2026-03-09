@@ -15,6 +15,7 @@
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#include <pcl/console/print.h>
 #include <pcl/filters/approximate_voxel_grid.h>
 
 namespace py = pybind11;
@@ -147,6 +148,7 @@ using NDTCuda = fast_gicp::NDTCuda<pcl::PointXYZ, pcl::PointXYZ>;
 #endif
 
 PYBIND11_MODULE(pygicp, m) {
+  pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
   m.def("downsample", &downsample, "downsample points");
 
   m.def("align_points", &align_points, "align two point sets",
