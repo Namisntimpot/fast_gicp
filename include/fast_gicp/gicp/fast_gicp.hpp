@@ -9,6 +9,7 @@
 #include <pcl/search/search.h>
 #include <pcl/registration/registration.h>
 #include <pcl/filters/filter.h>
+
 #include <fast_gicp/gicp/lsq_registration.hpp>
 #include <fast_gicp/gicp/gicp_settings.hpp>
 #include <ctime>
@@ -54,6 +55,13 @@ public:
   void setCorrespondenceRandomness(int k);
   void setRegularizationMethod(RegularizationMethod method);
   void setKNNMaxDistance(float k);
+  void setColorMatchingConfig(const ColorMatchingConfig& config);
+  void setColorMatchingEnabled(bool enable);
+  void setSourceColors(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& colors);
+  void setTargetColors(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& colors);
+  void clearSourceColors();
+  void clearTargetColors();
+  const ColorMatchingConfig& getColorMatchingConfig() const;
 
   virtual void swapSourceAndTarget() override;
   virtual void clearSource() override;
@@ -113,8 +121,13 @@ protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
 
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
+  bool color_matching_ready() const;
+  double color_distance_score(int source_index, int target_index) const;
+  virtual void collect_alignment_quality_metrics(
+    AlignmentQualityReport* report,
+    const Eigen::Isometry3d& final_pose) const override;
 
-  virtual double linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) override;
+  virtual double linearize(const Eigen::Isometry3d& trans, typename LsqRegistration<PointSource, PointTarget>::Matrix6* H, typename LsqRegistration<PointSource, PointTarget>::Vector6* b) override;
 
   virtual double compute_error(const Eigen::Isometry3d& trans) override;
 
@@ -195,6 +208,10 @@ protected:
 
   std::vector<int> correspondences_;
   std::vector<float> sq_distances_;
+
+  ColorMatchingConfig color_matching_config_;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_colors_;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> target_colors_;
 };
 }  // namespace fast_gicp
 

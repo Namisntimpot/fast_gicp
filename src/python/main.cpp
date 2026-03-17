@@ -20,6 +20,239 @@
 
 namespace py = pybind11;
 
+namespace {
+
+std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> numpy_to_vec3_list(const py::array& array) {
+  py::array_t<double, py::array::c_style | py::array::forcecast> casted(array);
+  py::buffer_info info = casted.request();
+
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> values;
+  if (info.ndim == 2 && info.shape[1] == 3) {
+    values.resize(info.shape[0]);
+    auto* data = static_cast<double*>(info.ptr);
+    for (ssize_t i = 0; i < info.shape[0]; i++) {
+      values[i] = Eigen::Vector3d(data[3 * i + 0], data[3 * i + 1], data[3 * i + 2]);
+    }
+    return values;
+  }
+
+  if (info.ndim == 1 && info.shape[0] % 3 == 0) {
+    values.resize(info.shape[0] / 3);
+    auto* data = static_cast<double*>(info.ptr);
+    for (ssize_t i = 0; i < values.size(); i++) {
+      values[i] = Eigen::Vector3d(data[3 * i + 0], data[3 * i + 1], data[3 * i + 2]);
+    }
+    return values;
+  }
+
+  throw std::invalid_argument("expected an Nx3 or flat 3N numpy array");
+}
+
+std::array<int, fast_gicp::kLsqDof> numpy_to_dof_mask(const py::array& array) {
+  py::array_t<int, py::array::c_style | py::array::forcecast> casted(array);
+  py::buffer_info info = casted.request();
+  if (info.ndim != 1 || info.shape[0] != fast_gicp::kLsqDof) {
+    throw std::invalid_argument("expected a flat length-6 mask");
+  }
+
+  std::array<int, fast_gicp::kLsqDof> mask{{0, 0, 0, 0, 0, 0}};
+  auto* data = static_cast<int*>(info.ptr);
+  for (int i = 0; i < fast_gicp::kLsqDof; i++) {
+    mask[i] = data[i] ? 1 : 0;
+  }
+  return mask;
+}
+
+py::array_t<int> dof_mask_to_numpy(const Eigen::Matrix<int, fast_gicp::kLsqDof, 1>& mask) {
+  py::array_t<int> result({fast_gicp::kLsqDof});
+  auto view = result.mutable_unchecked<1>();
+  for (int i = 0; i < fast_gicp::kLsqDof; i++) {
+    view(i) = mask[i];
+  }
+  return result;
+}
+
+py::array_t<double> dof_scores_to_numpy(const Eigen::Matrix<double, fast_gicp::kLsqDof, 1>& scores) {
+  py::array_t<double> result({fast_gicp::kLsqDof});
+  auto view = result.mutable_unchecked<1>();
+  for (int i = 0; i < fast_gicp::kLsqDof; i++) {
+    view(i) = scores[i];
+  }
+  return result;
+}
+
+py::array_t<double> dof_thresholds_to_numpy(const std::array<double, fast_gicp::kLsqDof>& thresholds) {
+  py::array_t<double> result({fast_gicp::kLsqDof});
+  auto view = result.mutable_unchecked<1>();
+  for (int i = 0; i < fast_gicp::kLsqDof; i++) {
+    view(i) = thresholds[i];
+  }
+  return result;
+}
+
+std::vector<double> numpy_to_double_list(const py::array& array) {
+  py::array_t<double, py::array::c_style | py::array::forcecast> casted(array);
+  py::buffer_info info = casted.request();
+  if (info.ndim != 1) {
+    throw std::invalid_argument("expected a flat numpy array");
+  }
+  auto* data = static_cast<double*>(info.ptr);
+  return std::vector<double>(data, data + info.shape[0]);
+}
+
+std::string optimizer_name(fast_gicp::LSQ_OPTIMIZER_TYPE type) {
+  switch (type) {
+    case fast_gicp::LSQ_OPTIMIZER_TYPE::GaussNewton:
+      return "GaussNewton";
+    case fast_gicp::LSQ_OPTIMIZER_TYPE::LevenbergMarquardt:
+      return "LevenbergMarquardt";
+  }
+  return "LevenbergMarquardt";
+}
+
+fast_gicp::LSQ_OPTIMIZER_TYPE optimizer_type(const std::string& name) {
+  if (name == "GaussNewton") {
+    return fast_gicp::LSQ_OPTIMIZER_TYPE::GaussNewton;
+  }
+  if (name == "LevenbergMarquardt") {
+    return fast_gicp::LSQ_OPTIMIZER_TYPE::LevenbergMarquardt;
+  }
+  throw std::invalid_argument("unknown optimizer type: " + name);
+}
+
+fast_gicp::ColorMatchingConfig color_matching_config_from_args(bool enabled, int candidate_count, double color_weight, double color_sigma) {
+  fast_gicp::ColorMatchingConfig config;
+  config.enable_color_matching = enabled;
+  config.geometric_candidate_count = candidate_count;
+  config.color_weight = color_weight;
+  config.color_sigma = color_sigma;
+  return config;
+}
+
+std::array<double, fast_gicp::kLsqDof> sequence_to_dof_thresholds(const py::handle& value) {
+  py::sequence seq = value.cast<py::sequence>();
+  if (py::len(seq) != fast_gicp::kLsqDof) {
+    throw std::invalid_argument("expected a length-6 sequence");
+  }
+
+  std::array<double, fast_gicp::kLsqDof> thresholds{};
+  for (int i = 0; i < fast_gicp::kLsqDof; i++) {
+    thresholds[i] = py::cast<double>(seq[i]);
+  }
+  return thresholds;
+}
+
+py::dict alignment_quality_config_to_dict(const fast_gicp::AlignmentQualityConfig& config) {
+  py::dict info;
+  info["enable_suggested_gating"] = config.enable_suggested_gating;
+  info["require_converged"] = config.require_converged;
+  info["min_correspondence_count"] = config.min_correspondence_count;
+  info["min_matched_count"] = config.min_matched_count;
+  info["min_matched_ratio"] = config.min_matched_ratio;
+  info["max_fitness_score"] = config.max_fitness_score;
+  info["max_final_cost"] = config.max_final_cost;
+  info["max_normalized_cost_per_match"] = config.max_normalized_cost_per_match;
+  info["max_mean_sq_distance"] = config.max_mean_sq_distance;
+  info["max_median_sq_distance"] = config.max_median_sq_distance;
+  info["max_p90_sq_distance"] = config.max_p90_sq_distance;
+  info["max_p95_sq_distance"] = config.max_p95_sq_distance;
+  info["min_rank"] = config.min_rank;
+  info["max_condition_number"] = config.max_condition_number;
+  info["max_ambiguity"] = config.max_ambiguity;
+  info["max_dof_ambiguity"] = dof_thresholds_to_numpy(config.max_dof_ambiguity);
+  info["max_anchor_mean_residual"] = config.max_anchor_mean_residual;
+  info["max_anchor_p95_residual"] = config.max_anchor_p95_residual;
+  return info;
+}
+
+void update_alignment_quality_config_from_dict(
+  fast_gicp::AlignmentQualityConfig* config,
+  const py::dict& options) {
+  for (auto item : options) {
+    const std::string key = py::cast<std::string>(item.first);
+    const py::handle value = item.second;
+
+    if (key == "enable_suggested_gating") {
+      config->enable_suggested_gating = py::cast<bool>(value);
+    } else if (key == "require_converged") {
+      config->require_converged = py::cast<bool>(value);
+    } else if (key == "min_correspondence_count") {
+      config->min_correspondence_count = py::cast<int>(value);
+    } else if (key == "min_matched_count") {
+      config->min_matched_count = py::cast<int>(value);
+    } else if (key == "min_matched_ratio") {
+      config->min_matched_ratio = py::cast<double>(value);
+    } else if (key == "max_fitness_score") {
+      config->max_fitness_score = py::cast<double>(value);
+    } else if (key == "max_final_cost") {
+      config->max_final_cost = py::cast<double>(value);
+    } else if (key == "max_normalized_cost_per_match") {
+      config->max_normalized_cost_per_match = py::cast<double>(value);
+    } else if (key == "max_mean_sq_distance") {
+      config->max_mean_sq_distance = py::cast<double>(value);
+    } else if (key == "max_median_sq_distance") {
+      config->max_median_sq_distance = py::cast<double>(value);
+    } else if (key == "max_p90_sq_distance") {
+      config->max_p90_sq_distance = py::cast<double>(value);
+    } else if (key == "max_p95_sq_distance") {
+      config->max_p95_sq_distance = py::cast<double>(value);
+    } else if (key == "min_rank") {
+      config->min_rank = py::cast<int>(value);
+    } else if (key == "max_condition_number") {
+      config->max_condition_number = py::cast<double>(value);
+    } else if (key == "max_ambiguity") {
+      config->max_ambiguity = py::cast<double>(value);
+    } else if (key == "max_dof_ambiguity") {
+      config->max_dof_ambiguity = sequence_to_dof_thresholds(value);
+    } else if (key == "max_anchor_mean_residual") {
+      config->max_anchor_mean_residual = py::cast<double>(value);
+    } else if (key == "max_anchor_p95_residual") {
+      config->max_anchor_p95_residual = py::cast<double>(value);
+    } else {
+      throw std::invalid_argument("unknown alignment quality config key: " + key);
+    }
+  }
+}
+
+py::dict alignment_quality_report_to_dict(const fast_gicp::AlignmentQualityReport& report) {
+  py::dict info;
+  info["valid"] = report.valid;
+  info["converged"] = report.converged;
+  info["gating_evaluated"] = report.gating_evaluated;
+  info["suggested_accept"] = report.suggested_accept;
+  info["has_match_statistics"] = report.has_match_statistics;
+  info["has_anchor_statistics"] = report.has_anchor_statistics;
+  info["used_sparse_anchors"] = report.used_sparse_anchors;
+  info["used_color_matching"] = report.used_color_matching;
+  info["optimizer_type"] = report.optimizer_type;
+  info["num_iterations"] = report.num_iterations;
+  info["source_count"] = report.source_count;
+  info["target_count"] = report.target_count;
+  info["correspondence_count"] = report.correspondence_count;
+  info["matched_count"] = report.matched_count;
+  info["anchor_count"] = report.anchor_count;
+  info["rank"] = report.rank;
+  info["fitness_score"] = report.fitness_score;
+  info["final_cost"] = report.final_cost;
+  info["normalized_cost_per_match"] = report.normalized_cost_per_match;
+  info["matched_ratio"] = report.matched_ratio;
+  info["mean_sq_distance"] = report.mean_sq_distance;
+  info["median_sq_distance"] = report.median_sq_distance;
+  info["p90_sq_distance"] = report.p90_sq_distance;
+  info["p95_sq_distance"] = report.p95_sq_distance;
+  info["condition_number"] = report.condition_number;
+  info["max_ambiguity"] = report.max_ambiguity;
+  info["anchor_mean_residual"] = report.anchor_mean_residual;
+  info["anchor_p95_residual"] = report.anchor_p95_residual;
+  info["ambiguity_scores"] = dof_scores_to_numpy(report.ambiguity_scores);
+  info["auto_suppressed_mask"] = dof_mask_to_numpy(report.auto_suppressed_mask);
+  info["hard_lock_mask"] = dof_mask_to_numpy(report.hard_lock_mask);
+  info["rejection_reasons"] = report.rejection_reasons;
+  return info;
+}
+
+}  // namespace
+
 fast_gicp::NeighborSearchMethod search_method(const std::string& neighbor_search_method) {
   if(neighbor_search_method == "DIRECT1") {
     return fast_gicp::NeighborSearchMethod::DIRECT1;
@@ -169,8 +402,66 @@ PYBIND11_MODULE(pygicp, m) {
     .def("set_input_target", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) { reg.setInputTarget(eigen2pcl(points)); })
     .def("set_input_source", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) { reg.setInputSource(eigen2pcl(points)); })
     .def("swap_source_and_target", &LsqRegistration::swapSourceAndTarget)
+    .def("set_lsq_optimizer_type", [] (LsqRegistration& reg, const std::string& name) { reg.setLSQOptimizerType(optimizer_type(name)); })
+    .def("set_observability_check", &LsqRegistration::setObservabilityCheck)
+    .def("set_observability_eigen_thresholds", &LsqRegistration::setObservabilityEigenThresholds)
+    .def("set_ambiguity_score_threshold", &LsqRegistration::setAmbiguityScoreThreshold)
+    .def("set_auto_soft_prior_strength", &LsqRegistration::setAutoSoftPriorStrength)
+    .def("set_hard_lock_mask", [] (LsqRegistration& reg, const py::array& mask) { reg.setHardLockMask(numpy_to_dof_mask(mask)); })
+    .def("set_preferred_ambiguous_mask", [] (LsqRegistration& reg, const py::array& mask) { reg.setPreferredAmbiguousMask(numpy_to_dof_mask(mask)); })
+    .def("set_prefer_user_marked_dofs", &LsqRegistration::setPreferUserMarkedDofs)
+    .def("set_enable_observability_diagnostics", &LsqRegistration::setEnableObservabilityDiagnostics)
+    .def("set_alignment_quality_config", [] (LsqRegistration& reg, const py::dict& options) {
+      auto config = reg.getAlignmentQualityConfig();
+      update_alignment_quality_config_from_dict(&config, options);
+      reg.setAlignmentQualityConfig(config);
+    })
+    .def("set_use_sparse_anchors", &LsqRegistration::setSparseAnchorUsage)
+    .def("set_sparse_anchor_correspondences", [] (LsqRegistration& reg, const py::array& source_points, const py::array& target_points, const py::object& weights, const py::object& sigmas) {
+      const auto source = numpy_to_vec3_list(source_points);
+      const auto target = numpy_to_vec3_list(target_points);
+      const auto weight_values = weights.is_none() ? std::vector<double>() : numpy_to_double_list(weights.cast<py::array>());
+      const auto sigma_values = sigmas.is_none() ? std::vector<double>() : numpy_to_double_list(sigmas.cast<py::array>());
+      reg.setSparseAnchorCorrespondences(source, target, weight_values, sigma_values);
+    }, py::arg("source_points"), py::arg("target_points"), py::arg("weights") = py::none(), py::arg("sigmas") = py::none())
+    .def("clear_sparse_anchor_correspondences", &LsqRegistration::clearSparseAnchorCorrespondences)
     .def("get_final_hessian", &LsqRegistration::getFinalHessian)
+    .def("get_final_regularized_hessian", &LsqRegistration::getFinalRegularizedHessian)
     .def("get_final_transformation", &LsqRegistration::getFinalTransformation)
+    .def("get_observability_config", [] (LsqRegistration& reg) {
+      const auto& config = reg.getObservabilityConfig();
+      py::dict info;
+      info["enable_observability_check"] = config.enable_observability_check;
+      info["relative_eigenvalue_threshold"] = config.relative_eigenvalue_threshold;
+      info["absolute_eigenvalue_threshold"] = config.absolute_eigenvalue_threshold;
+      info["ambiguity_score_threshold"] = config.ambiguity_score_threshold;
+      info["auto_soft_prior_strength"] = config.auto_soft_prior_strength;
+      info["hard_lock_mask"] = py::cast(std::vector<int>(config.hard_lock_mask.begin(), config.hard_lock_mask.end()));
+      info["preferred_ambiguous_mask"] = py::cast(std::vector<int>(config.preferred_ambiguous_mask.begin(), config.preferred_ambiguous_mask.end()));
+      info["prefer_user_marked_dofs"] = config.prefer_user_marked_dofs;
+      info["enable_diagnostics"] = config.enable_diagnostics;
+      return info;
+    })
+    .def("get_alignment_quality_config", [] (LsqRegistration& reg) {
+      return alignment_quality_config_to_dict(reg.getAlignmentQualityConfig());
+    })
+    .def("get_observability_diagnostics", [] (LsqRegistration& reg) {
+      const auto& diagnostics = reg.getObservabilityDiagnostics();
+      py::dict info;
+      info["raw_hessian"] = diagnostics.raw_hessian;
+      info["regularized_hessian"] = diagnostics.regularized_hessian;
+      info["eigenvalues"] = diagnostics.eigenvalues;
+      info["ambiguity_scores"] = diagnostics.ambiguity_scores;
+      info["auto_suppressed_mask"] = dof_mask_to_numpy(diagnostics.auto_suppressed_mask);
+      info["hard_lock_mask"] = dof_mask_to_numpy(diagnostics.hard_lock_mask);
+      info["preferred_ambiguous_mask"] = dof_mask_to_numpy(diagnostics.preferred_ambiguous_mask);
+      info["condition_number"] = diagnostics.condition_number;
+      info["estimated_rank"] = diagnostics.estimated_rank;
+      return info;
+    })
+    .def("get_alignment_quality_report", [] (LsqRegistration& reg) {
+      return alignment_quality_report_to_dict(reg.getAlignmentQualityReport());
+    })
     .def("get_fitness_score", [] (LsqRegistration& reg, const double max_range) { return reg.getFitnessScore(max_range); })
     .def("align",
       [] (LsqRegistration& reg, const Eigen::Matrix4f& initial_guess) { 
@@ -205,25 +496,38 @@ PYBIND11_MODULE(pygicp, m) {
     .def("set_correspondence_randomness", &FastGICP::setCorrespondenceRandomness)
     .def("set_max_correspondence_distance", &FastGICP::setMaxCorrespondenceDistance)
     .def("set_max_knn_distance", &FastGICP::setKNNMaxDistance)
+    .def("set_color_matching", [] (FastGICP& gicp, bool enabled, int candidate_count, double color_weight, double color_sigma) {
+      gicp.setColorMatchingConfig(color_matching_config_from_args(enabled, candidate_count, color_weight, color_sigma));
+    }, py::arg("enabled") = true, py::arg("candidate_count") = 5, py::arg("color_weight") = 0.0, py::arg("color_sigma") = 32.0)
+    .def("set_color_matching_enabled", &FastGICP::setColorMatchingEnabled)
+    .def("get_color_matching_config", [] (FastGICP& gicp) {
+      const auto& config = gicp.getColorMatchingConfig();
+      py::dict info;
+      info["enable_color_matching"] = config.enable_color_matching;
+      info["geometric_candidate_count"] = config.geometric_candidate_count;
+      info["color_weight"] = config.color_weight;
+      info["color_sigma"] = config.color_sigma;
+      return info;
+    })
+    .def("set_source_colors", [] (FastGICP& gicp, const py::array& colors) {
+      gicp.setSourceColors(numpy_to_vec3_list(colors));
+    })
+    .def("set_target_colors", [] (FastGICP& gicp, const py::array& colors) {
+      gicp.setTargetColors(numpy_to_vec3_list(colors));
+    })
+    .def("clear_source_colors", &FastGICP::clearSourceColors)
+    .def("clear_target_colors", &FastGICP::clearTargetColors)
     .def("get_source_rotationsq", [] (FastGICP& gicp){
       return py::array(gicp.getSourceRotationsqSize(), gicp.getSourceRotationsq().data());
-      // std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> source_rotationsq = gicp.getSourceRotationsq();
-      // py::list data; for(const auto& q:source_rotationsq) data.append(q); return data;
       })
     .def("get_target_rotationsq", [] (FastGICP& gicp){
       return py::array(gicp.getTargetRotationsqSize(), gicp.getTargetRotationsq().data());
-      // std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> target_rotationsq = gicp.getTargetRotationsq();
-      // py::list data; for(const auto& q:target_rotationsq) data.append(q); return data;
       })
     .def("get_source_scales", [] (FastGICP& gicp){
       return py::array(gicp.getSourceScaleSize(), gicp.getSourceScales().data());
-      // std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_scales = gicp.getSourceScales();
-      // py::list data; for(const auto& s:source_scales) data.append(s); return data;
       })
     .def("get_target_scales", [] (FastGICP& gicp){
       return py::array(gicp.getTargetScaleSize(), gicp.getTargetScales().data());
-      // std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> target_scales = gicp.getTargetScales();
-      // py::list data; for(const auto& s:target_scales) data.append(s); return data;
       })
     .def("calculate_source_covariance", &FastGICP::calculateSourceCovariance)
     .def("calculate_target_covariance", &FastGICP::calculateTargetCovariance)

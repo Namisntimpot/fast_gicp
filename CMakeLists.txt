@@ -4,6 +4,7 @@ project(fast_gicp)
 option(BUILD_VGICP_CUDA "Build GPU-powered VGICP" OFF)
 option(BUILD_apps "Build application programs" ON)
 option(BUILD_test "Build test programs" OFF)
+option(BUILD_benchmarks "Build benchmark programs" OFF)
 option(BUILD_PYTHON_BINDINGS "Build python bindings" OFF)
 
 set(CMAKE_BUILD_TYPE "Release")
@@ -151,12 +152,15 @@ endif()
 
 ### TEST ###
 if(BUILD_test)
-  find_package(GTest REQUIRED)
+  add_executable(gicp_selfcheck src/test/gicp_selfcheck.cpp)
+  add_dependencies(gicp_selfcheck fast_gicp)
+  target_link_libraries(gicp_selfcheck ${PCL_LIBRARIES} fast_gicp)
+endif()
 
-  add_executable(gicp_test src/test/gicp_test.cpp)
-  add_dependencies(gicp_test fast_gicp)
-  target_link_libraries(gicp_test ${GTEST_LIBRARIES} ${PCL_LIBRARIES} fast_gicp)
-  gtest_add_tests(TARGET gicp_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} EXTRA_ARGS "${CMAKE_SOURCE_DIR}/data")
+if(BUILD_benchmarks)
+  add_executable(gicp_benchmark src/test/gicp_benchmark.cpp)
+  add_dependencies(gicp_benchmark fast_gicp)
+  target_link_libraries(gicp_benchmark ${PCL_LIBRARIES} fast_gicp)
 endif()
 
 if(catkin_FOUND)

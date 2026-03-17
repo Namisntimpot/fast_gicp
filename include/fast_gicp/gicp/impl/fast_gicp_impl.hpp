@@ -1,9 +1,39 @@
 #ifndef FAST_GICP_FAST_GICP_IMPL_HPP
 #define FAST_GICP_FAST_GICP_IMPL_HPP
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+
 #include <fast_gicp/so3/so3.hpp>
 
 namespace fast_gicp {
+
+namespace detail_fast_gicp {
+
+inline double percentile_from_sorted(const std::vector<double>& values, double q) {
+  if (values.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  if (values.size() == 1) {
+    return values.front();
+  }
+
+  const double clamped_q = std::min(1.0, std::max(0.0, q));
+  const double scaled = clamped_q * static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(scaled));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(scaled));
+  if (lower == upper) {
+    return values[lower];
+  }
+
+  const double t = scaled - static_cast<double>(lower);
+  return (1.0 - t) * values[lower] + t * values[upper];
+}
+
+}  // namespace detail_fast_gicp
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::FastGICP() {
@@ -30,6 +60,7 @@ FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::Fast
   regularization_method_ = RegularizationMethod::NORMALIZED_ELLIPSE;
   search_source_.reset(new SearchMethodSource);
   search_target_.reset(new SearchMethodTarget);
+  color_matching_config_ = ColorMatchingConfig();
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -63,12 +94,50 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setColorMatchingConfig(const ColorMatchingConfig& config) {
+  color_matching_config_ = config;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setColorMatchingEnabled(bool enable) {
+  color_matching_config_.enable_color_matching = enable;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setSourceColors(
+  const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& colors) {
+  source_colors_ = colors;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setTargetColors(
+  const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& colors) {
+  target_colors_ = colors;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::clearSourceColors() {
+  source_colors_.clear();
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::clearTargetColors() {
+  target_colors_.clear();
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+const ColorMatchingConfig& FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::getColorMatchingConfig() const {
+  return color_matching_config_;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::swapSourceAndTarget() {
   input_.swap(target_);
   search_source_.swap(search_target_);
   source_covs_.swap(target_covs_);
   source_rotationsq_.swap(target_rotationsq_);
   source_scales_.swap(target_scales_);
+  source_colors_.swap(target_colors_);
 
   correspondences_.clear();
   sq_distances_.clear();
@@ -80,6 +149,7 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   source_covs_.clear();
   source_rotationsq_.clear();
   source_scales_.clear();
+  source_colors_.clear();
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -88,6 +158,7 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   target_covs_.clear();
   target_rotationsq_.clear();
   target_scales_.clear();
+  target_colors_.clear();
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -101,7 +172,6 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   source_covs_.clear();
   source_rotationsq_.clear();
   source_scales_.clear();
-  // std::cout<<"set input source end"<<std::endl;
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -126,7 +196,25 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   target_covs_.clear();
   target_rotationsq_.clear();
   target_scales_.clear();
-  // std::cout<<"set input target end"<<std::endl;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::color_matching_ready() const {
+  return color_matching_config_.enable_color_matching &&
+         color_matching_config_.color_weight > 0.0 &&
+         source_colors_.size() == input_->size() &&
+         target_colors_.size() == target_->size();
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::color_distance_score(int source_index, int target_index) const {
+  if (!color_matching_ready()) {
+    return 0.0;
+  }
+
+  const double sigma = std::max(color_matching_config_.color_sigma, 1e-9);
+  const Eigen::Vector3d diff = source_colors_[source_index] - target_colors_[target_index];
+  return color_matching_config_.color_weight * diff.squaredNorm() / (sigma * sigma);
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -227,14 +315,18 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
     throw std::invalid_argument("FastGICP: destination cloud cannot be identical to source or target");
   }
   if (source_covs_.size() != input_->size()) {
-    // std::cout<<"compute source cov"<<std::endl;
-    // calculate_covariances(input_, *search_source_, source_covs_, source_rotationsq_, source_scales_);
-    // calculate_covariances_withz(input_, *search_source_, source_covs_, source_rotationsq_, source_scales_, source_z_values_);
-    calculate_source_covariances_with_filter(input_, *search_source_, source_covs_, source_rotationsq_, source_scales_, source_filter_);
+    if (!source_filter_.empty() && source_filter_.size() == input_->size() && source_num_trackable_points_ > 0) {
+      calculate_source_covariances_with_filter(input_, *search_source_, source_covs_, source_rotationsq_, source_scales_, source_filter_);
+    } else {
+      calculate_covariances(input_, *search_source_, source_covs_, source_rotationsq_, source_scales_);
+    }
   }
   if (target_covs_.size() != target_->size()) {
-    // std::cout<<"compute target cov"<<std::endl;
-    calculate_covariances(target_, *search_target_, target_covs_, target_rotationsq_, target_scales_);
+    if (!target_filter_.empty() && target_filter_.size() == target_->size() && target_num_trackable_points_ > 0) {
+      calculate_target_covariances_with_filter(target_, *search_target_, target_covs_, target_rotationsq_, target_scales_, target_filter_);
+    } else {
+      calculate_covariances(target_, *search_target_, target_covs_, target_rotationsq_, target_scales_);
+    }
   }
   LsqRegistration<PointSource, PointTarget>::computeTransformation(output, guess);
 }
@@ -250,25 +342,37 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   sq_distances_.resize(input_->size());
   mahalanobis_.resize(input_->size());
 
-  std::vector<int> k_indices(1);
-  std::vector<float> k_sq_dists(1);
+  const bool use_color = color_matching_ready();
+  const int candidate_count = use_color ? std::max(1, color_matching_config_.geometric_candidate_count) : 1;
+  std::vector<int> k_indices(candidate_count);
+  std::vector<float> k_sq_dists(candidate_count);
 
 #pragma omp parallel for num_threads(num_threads_) firstprivate(k_indices, k_sq_dists) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
     PointTarget pt;
     
     pt.getVector4fMap() = trans_f * input_->at(i).getVector4fMap();
-    
-    // if (!pcl::isFinite(pt)){
-    //   // std::cout << trans_f.data() << std::endl;
-    //   // std::cout << pt.x << pt.y << pt.z << std::endl;
-    //   continue;
-    // }
-    
-    search_target_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
-    
-    sq_distances_[i] = k_sq_dists[0];
-    correspondences_[i] = k_sq_dists[0] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices[0] : -1;
+
+    search_target_->nearestKSearch(pt, candidate_count, k_indices, k_sq_dists);
+
+    int best_index = -1;
+    float best_sq_dist = std::numeric_limits<float>::max();
+    double best_score = std::numeric_limits<double>::max();
+    for (int candidate = 0; candidate < k_indices.size(); candidate++) {
+      if (k_sq_dists[candidate] >= corr_dist_threshold_ * corr_dist_threshold_) {
+        continue;
+      }
+
+      const double score = static_cast<double>(k_sq_dists[candidate]) + color_distance_score(i, k_indices[candidate]);
+      if (score < best_score) {
+        best_score = score;
+        best_sq_dist = k_sq_dists[candidate];
+        best_index = k_indices[candidate];
+      }
+    }
+
+    sq_distances_[i] = best_sq_dist;
+    correspondences_[i] = best_index;
     if (correspondences_[i] < 0) {
       continue;
     }
@@ -293,7 +397,10 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
-double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) {
+double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::linearize(
+  const Eigen::Isometry3d& trans,
+  typename LsqRegistration<PointSource, PointTarget>::Matrix6* H,
+  typename LsqRegistration<PointSource, PointTarget>::Vector6* b) {
   update_correspondences(trans);
 
   double sum_errors = 0.0;
@@ -375,6 +482,47 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
   }
 
   return sum_errors;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::collect_alignment_quality_metrics(
+  AlignmentQualityReport* report,
+  const Eigen::Isometry3d& final_pose) const {
+  (void)final_pose;
+
+  report->used_color_matching = color_matching_ready();
+  report->has_match_statistics = true;
+  report->correspondence_count = 0;
+  report->matched_count = 0;
+
+  std::vector<double> valid_sq_distances;
+  valid_sq_distances.reserve(sq_distances_.size());
+  for (std::size_t i = 0; i < correspondences_.size(); i++) {
+    if (correspondences_[i] < 0) {
+      continue;
+    }
+
+    report->matched_count++;
+    report->correspondence_count++;
+    if (std::isfinite(sq_distances_[i])) {
+      valid_sq_distances.push_back(static_cast<double>(sq_distances_[i]));
+    }
+  }
+
+  if (report->source_count > 0) {
+    report->matched_ratio = static_cast<double>(report->matched_count) / static_cast<double>(report->source_count);
+  }
+
+  if (valid_sq_distances.empty()) {
+    return;
+  }
+
+  std::sort(valid_sq_distances.begin(), valid_sq_distances.end());
+  report->mean_sq_distance =
+    std::accumulate(valid_sq_distances.begin(), valid_sq_distances.end(), 0.0) / static_cast<double>(valid_sq_distances.size());
+  report->median_sq_distance = detail_fast_gicp::percentile_from_sorted(valid_sq_distances, 0.5);
+  report->p90_sq_distance = detail_fast_gicp::percentile_from_sorted(valid_sq_distances, 0.90);
+  report->p95_sq_distance = detail_fast_gicp::percentile_from_sorted(valid_sq_distances, 0.95);
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>

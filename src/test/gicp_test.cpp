@@ -1,6 +1,8 @@
 #include <vector>
 #include <sstream>
 #include <iostream>
+#include <array>
+#include <cmath>
 #include <gtest/gtest.h>
 
 #include <pcl/io/pcd_io.h>
@@ -85,6 +87,58 @@ public:
 };
 
 std::string GICPTestBase::data_directory;
+
+namespace {
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr make_vertical_plane(int y_count = 16, int z_count = 16, double step = 0.1) {
+  auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  cloud->reserve(y_count * z_count);
+  for (int iy = 0; iy < y_count; iy++) {
+    for (int iz = 0; iz < z_count; iz++) {
+      pcl::PointXYZ point;
+      point.x = 0.0f;
+      point.y = static_cast<float>((iy - y_count / 2) * step);
+      point.z = static_cast<float>((iz - z_count / 2) * step);
+      cloud->push_back(point);
+    }
+  }
+  return cloud;
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr make_box_cloud(int count_per_axis = 5, double step = 0.12) {
+  auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  cloud->reserve(count_per_axis * count_per_axis * count_per_axis);
+  for (int ix = 0; ix < count_per_axis; ix++) {
+    for (int iy = 0; iy < count_per_axis; iy++) {
+      for (int iz = 0; iz < count_per_axis; iz++) {
+        pcl::PointXYZ point;
+        point.x = static_cast<float>((ix - count_per_axis / 2) * step);
+        point.y = static_cast<float>((iy - count_per_axis / 2) * step);
+        point.z = static_cast<float>((iz - count_per_axis / 2) * step);
+        cloud->push_back(point);
+      }
+    }
+  }
+  return cloud;
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr transform_cloud(
+  const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud,
+  const Eigen::Matrix4f& transform) {
+  auto transformed = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  pcl::transformPointCloud(*cloud, *transformed, transform);
+  return transformed;
+}
+
+std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> identity_covariances(int count) {
+  return std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>(count, Eigen::Matrix4d::Identity());
+}
+
+std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> solid_colors(int count, const Eigen::Vector3d& color) {
+  return std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>(count, color);
+}
+
+}  // namespace
 
 TEST_F(GICPTestBase, LoadCheck) {
   EXPECT_NE(target, nullptr);
@@ -198,6 +252,109 @@ TEST_P(AlignmentTest, test) {
   EXPECT_LT(errors[0], t_tol) << "SWAP AND SET TARGET TEST";
   EXPECT_LT(errors[1], r_tol) << "SWAP AND SET TARGET TEST";
   EXPECT_TRUE(reg->hasConverged()) << "SWAP AND SET TARGET TEST";
+}
+
+TEST(RobustGICPTest, ObservabilityDiagnosticsDetectPlanarAmbiguity) {
+  auto target = make_vertical_plane();
+  auto source = make_vertical_plane();
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+  reg.setInputTarget(target);
+  reg.setInputSource(source);
+  reg.setMaxCorrespondenceDistance(1.0);
+  reg.setObservabilityCheck(true);
+  reg.setEnableObservabilityDiagnostics(true);
+
+  reg.evaluateCost(Eigen::Matrix4f::Identity());
+  const auto& diagnostics = reg.getObservabilityDiagnostics();
+
+  EXPECT_LT(diagnostics.estimated_rank, fast_gicp::kLsqDof);
+  EXPECT_GT(diagnostics.ambiguity_scores[5], 0.1);
+  EXPECT_TRUE(std::isinf(diagnostics.condition_number) || diagnostics.condition_number > 1e3);
+}
+
+TEST(RobustGICPTest, HardLockKeepsTranslationZFixed) {
+  auto target = make_box_cloud();
+
+  Eigen::Matrix4f true_transform = Eigen::Matrix4f::Identity();
+  true_transform(0, 3) = 0.2f;
+  true_transform(1, 3) = -0.1f;
+  true_transform(2, 3) = 0.3f;
+  auto source = transform_cloud(target, true_transform.inverse());
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+  reg.setInputTarget(target);
+  reg.setInputSource(source);
+  reg.setMaxCorrespondenceDistance(1.0);
+  reg.setHardLockMask({{0, 0, 0, 0, 0, 1}});
+
+  pcl::PointCloud<pcl::PointXYZ> aligned;
+  reg.align(aligned);
+
+  const Eigen::Matrix4f estimated = reg.getFinalTransformation();
+  EXPECT_NEAR(estimated(2, 3), 0.0f, 1e-5f);
+  EXPECT_NEAR(estimated(0, 3), true_transform(0, 3), 0.05f);
+}
+
+TEST(RobustGICPTest, SparseAnchorsBiasAmbiguousTranslation) {
+  auto target = make_vertical_plane();
+  auto source = make_vertical_plane();
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> no_anchor_reg;
+  no_anchor_reg.setInputTarget(target);
+  no_anchor_reg.setInputSource(source);
+  no_anchor_reg.setMaxCorrespondenceDistance(1.0);
+
+  pcl::PointCloud<pcl::PointXYZ> aligned;
+  no_anchor_reg.align(aligned);
+  const double no_anchor_z = no_anchor_reg.getFinalTransformation()(2, 3);
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> anchor_reg;
+  anchor_reg.setInputTarget(target);
+  anchor_reg.setInputSource(source);
+  anchor_reg.setMaxCorrespondenceDistance(1.0);
+
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_anchors;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> target_anchors;
+  std::vector<double> weights;
+  for (int i = 0; i < 4; i++) {
+    const auto& point = source->at(i * 10);
+    source_anchors.emplace_back(point.x, point.y, point.z);
+    target_anchors.emplace_back(point.x, point.y, point.z + 0.2);
+    weights.push_back(50.0);
+  }
+
+  anchor_reg.setSparseAnchorCorrespondences(source_anchors, target_anchors, weights);
+  anchor_reg.align(aligned);
+  const double anchor_z = anchor_reg.getFinalTransformation()(2, 3);
+
+  EXPECT_LT(std::abs(no_anchor_z), 0.05);
+  EXPECT_GT(anchor_z, 0.1);
+}
+
+TEST(RobustGICPTest, ColorMatchingChangesCorrespondenceSelection) {
+  auto target = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  target->push_back(pcl::PointXYZ(0.05f, 0.0f, 0.0f));
+  target->push_back(pcl::PointXYZ(0.10f, 0.0f, 0.0f));
+
+  auto source = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  source->push_back(pcl::PointXYZ(0.0f, 0.0f, 0.0f));
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+  reg.setInputTarget(target);
+  reg.setInputSource(source);
+  reg.setMaxCorrespondenceDistance(1.0);
+  reg.setSourceCovariances(identity_covariances(1));
+  reg.setTargetCovariances(identity_covariances(2));
+  reg.setSourceColors(solid_colors(1, Eigen::Vector3d(255.0, 0.0, 0.0)));
+  reg.setTargetColors({
+    Eigen::Vector3d(0.0, 0.0, 255.0),
+    Eigen::Vector3d(255.0, 0.0, 0.0),
+  });
+  reg.setColorMatchingConfig({true, 2, 1.0, 16.0});
+
+  reg.evaluateCost(Eigen::Matrix4f::Identity());
+  EXPECT_EQ(reg.getSourceCorrespondences()[0], 1);
 }
 
 int main(int argc, char** argv) {

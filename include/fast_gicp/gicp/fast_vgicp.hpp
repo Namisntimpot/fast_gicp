@@ -70,6 +70,9 @@ public:
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
   virtual void update_correspondences(const Eigen::Isometry3d& trans) override;
+  virtual void collect_alignment_quality_metrics(
+    AlignmentQualityReport* report,
+    const Eigen::Isometry3d& final_pose) const override;
   virtual double linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H = nullptr, Eigen::Matrix<double, 6, 1>* b = nullptr) override;
   virtual double compute_error(const Eigen::Isometry3d& trans) override;
 

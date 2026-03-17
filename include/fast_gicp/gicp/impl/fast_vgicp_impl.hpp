@@ -2,6 +2,10 @@
 #define FAST_GICP_FAST_VGICP_IMPL_HPP
 
 #include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -14,6 +18,31 @@
 #include <fast_gicp/gicp/fast_vgicp.hpp>
 
 namespace fast_gicp {
+
+namespace detail_fast_vgicp {
+
+inline double percentile_from_sorted(const std::vector<double>& values, double q) {
+  if (values.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  if (values.size() == 1) {
+    return values.front();
+  }
+
+  const double clamped_q = std::min(1.0, std::max(0.0, q));
+  const double scaled = clamped_q * static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(scaled));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(scaled));
+  if (lower == upper) {
+    return values[lower];
+  }
+
+  const double t = scaled - static_cast<double>(lower);
+  return (1.0 - t) * values[lower] + t * values[upper];
+}
+
+}  // namespace detail_fast_vgicp
 
 template <typename PointSource, typename PointTarget>
 FastVGICP<PointSource, PointTarget>::FastVGICP() : FastGICP<PointSource, PointTarget>() {
@@ -73,6 +102,7 @@ template <typename PointSource, typename PointTarget>
 void FastVGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Isometry3d& trans) {
   voxel_correspondences_.clear();
   auto offsets = neighbor_offsets(search_method_);
+  const bool use_color = this->color_matching_ready();
 
   std::vector<std::vector<std::pair<int, GaussianVoxel::Ptr>>> corrs(num_threads_);
   for (auto& c : corrs) {
@@ -84,6 +114,34 @@ void FastVGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Is
     const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
     Eigen::Vector4d transed_mean_A = trans * mean_A;
     Eigen::Vector3i coord = voxelmap_->voxel_coord(transed_mean_A);
+
+    if (use_color) {
+      GaussianVoxel::Ptr best_voxel = nullptr;
+      double best_score = std::numeric_limits<double>::max();
+      for (const auto& offset : offsets) {
+        auto voxel = voxelmap_->lookup_voxel(coord + offset);
+        if (voxel == nullptr) {
+          continue;
+        }
+
+        const double geometry_score = (voxel->mean - transed_mean_A).template head<3>().squaredNorm();
+        const double sigma = std::max(this->color_matching_config_.color_sigma, 1e-9);
+        const double color_score =
+          this->color_matching_config_.color_weight *
+          (this->source_colors_[i] - voxel->mean_color).squaredNorm() /
+          (sigma * sigma);
+        const double total_score = geometry_score + color_score;
+        if (total_score < best_score) {
+          best_score = total_score;
+          best_voxel = voxel;
+        }
+      }
+
+      if (best_voxel != nullptr) {
+        corrs[omp_get_thread_num()].push_back(std::make_pair(i, best_voxel));
+      }
+      continue;
+    }
 
     for (const auto& offset : offsets) {
       auto voxel = voxelmap_->lookup_voxel(coord + offset);
@@ -119,7 +177,11 @@ template <typename PointSource, typename PointTarget>
 double FastVGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) {
   if (voxelmap_ == nullptr) {
     voxelmap_.reset(new GaussianVoxelMap<PointTarget>(voxel_resolution_, voxel_mode_));
-    voxelmap_->create_voxelmap(*target_, target_covs_);
+    if (this->color_matching_ready()) {
+      voxelmap_->create_voxelmap(*target_, target_covs_, &this->target_colors_);
+    } else {
+      voxelmap_->create_voxelmap(*target_, target_covs_);
+    }
   }
 
   update_correspondences(trans);
@@ -201,6 +263,52 @@ double FastVGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3
   }
 
   return sum_errors;
+}
+
+template <typename PointSource, typename PointTarget>
+void FastVGICP<PointSource, PointTarget>::collect_alignment_quality_metrics(
+  AlignmentQualityReport* report,
+  const Eigen::Isometry3d& final_pose) const {
+  report->used_color_matching = this->color_matching_ready();
+  report->has_match_statistics = true;
+  report->correspondence_count = static_cast<int>(voxel_correspondences_.size());
+  report->matched_count = 0;
+
+  if (input_ == nullptr || input_->empty()) {
+    return;
+  }
+
+  std::vector<unsigned char> matched(input_->size(), 0);
+  std::vector<double> residual_sq_distances;
+  residual_sq_distances.reserve(voxel_correspondences_.size());
+
+  for (const auto& corr : voxel_correspondences_) {
+    if (corr.first < 0 || corr.first >= input_->size() || corr.second == nullptr) {
+      continue;
+    }
+
+    matched[corr.first] = 1;
+
+    const Eigen::Vector4d mean_A = input_->at(corr.first).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d transformed = final_pose * mean_A;
+    const Eigen::Vector3d residual = (corr.second->mean - transformed).template head<3>();
+    residual_sq_distances.push_back(residual.squaredNorm());
+  }
+
+  report->matched_count = std::accumulate(matched.begin(), matched.end(), 0);
+  report->matched_ratio = static_cast<double>(report->matched_count) / static_cast<double>(input_->size());
+
+  if (residual_sq_distances.empty()) {
+    return;
+  }
+
+  std::sort(residual_sq_distances.begin(), residual_sq_distances.end());
+  report->mean_sq_distance =
+    std::accumulate(residual_sq_distances.begin(), residual_sq_distances.end(), 0.0) /
+    static_cast<double>(residual_sq_distances.size());
+  report->median_sq_distance = detail_fast_vgicp::percentile_from_sorted(residual_sq_distances, 0.5);
+  report->p90_sq_distance = detail_fast_vgicp::percentile_from_sorted(residual_sq_distances, 0.90);
+  report->p95_sq_distance = detail_fast_vgicp::percentile_from_sorted(residual_sq_distances, 0.95);
 }
 
 }  // namespace fast_gicp

@@ -63,10 +63,15 @@ public:
     num_points = 0;
     mean.setZero();
     cov.setZero();
+    mean_color.setZero();
+    color_sum.setZero();
   }
   virtual ~GaussianVoxel() {}
 
   virtual void append(const Eigen::Vector4d& mean_, const Eigen::Matrix4d& cov_) = 0;
+  virtual void append_color(const Eigen::Vector3d& color) {
+    color_sum += color;
+  }
 
   virtual void finalize() = 0;
 
@@ -74,6 +79,17 @@ public:
   int num_points;
   Eigen::Vector4d mean;
   Eigen::Matrix4d cov;
+  Eigen::Vector3d mean_color;
+
+protected:
+  void finalize_color() {
+    if (num_points > 0) {
+      mean_color = color_sum / static_cast<double>(num_points);
+    }
+  }
+
+private:
+  Eigen::Vector3d color_sum;
 };
 
 struct MultiplicativeGaussianVoxel : GaussianVoxel {
@@ -99,6 +115,7 @@ public:
 
     cov = cov.inverse().eval();
     mean = (cov * mean).eval();
+    finalize_color();
   }
 };
 
@@ -118,6 +135,7 @@ public:
   virtual void finalize() override {
     mean /= num_points;
     cov /= num_points;
+    finalize_color();
   }
 };
 
@@ -126,7 +144,10 @@ class GaussianVoxelMap {
 public:
   GaussianVoxelMap(double resolution, VoxelAccumulationMode mode) : voxel_resolution_(resolution), voxel_mode_(mode) {}
 
-  void create_voxelmap(const pcl::PointCloud<PointT>& cloud, const std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covs) {
+  void create_voxelmap(
+    const pcl::PointCloud<PointT>& cloud,
+    const std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covs,
+    const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>* colors = nullptr) {
     voxels_.clear();
     for(int i = 0; i < cloud.size(); i++) {
       Eigen::Vector3i coord = voxel_coord(cloud.at(i).getVector4fMap().template cast<double>());
@@ -148,6 +169,9 @@ public:
 
       auto& voxel = found->second;
       voxel->append(cloud.at(i).getVector4fMap().template cast<double>(), covs[i]);
+      if (colors != nullptr && colors->size() == cloud.size()) {
+        voxel->append_color((*colors)[i]);
+      }
     }
 
     for(auto& voxel : voxels_) {
