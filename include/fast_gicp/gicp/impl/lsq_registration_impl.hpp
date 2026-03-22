@@ -76,6 +76,29 @@ inline const std::array<const char*, kLsqDof>& ambiguity_reason_names() {
   return kReasonNames;
 }
 
+inline const char* sparse_anchor_balance_mode_name(SparseAnchorBalanceMode mode) {
+  switch (mode) {
+    case SparseAnchorBalanceMode::NONE:
+      return "NONE";
+    case SparseAnchorBalanceMode::BY_COUNT:
+      return "BY_COUNT";
+    case SparseAnchorBalanceMode::BY_HESSIAN_TRACE:
+      return "BY_HESSIAN_TRACE";
+  }
+
+  return "NONE";
+}
+
+inline double trace_on_unlocked_dofs(const Eigen::Matrix<double, kLsqDof, kLsqDof>& H, const std::array<int, kLsqDof>& hard_lock_mask) {
+  double trace = 0.0;
+  for (int i = 0; i < kLsqDof; i++) {
+    if (!hard_lock_mask[i]) {
+      trace += H(i, i);
+    }
+  }
+  return trace;
+}
+
 }  // namespace detail
 
 template <typename PointTarget, typename PointSource>
@@ -201,6 +224,39 @@ const AlignmentQualityReport& LsqRegistration<PointTarget, PointSource>::getAlig
 }
 
 template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setSparseAnchorConfig(const SparseAnchorConfig& config) {
+  if (!std::isfinite(config.objective_weight) || config.objective_weight < 0.0) {
+    throw std::invalid_argument("LsqRegistration: sparse anchor objective_weight must be finite and non-negative");
+  }
+  if (!std::isfinite(config.auto_balance_min) || !std::isfinite(config.auto_balance_max) ||
+      config.auto_balance_min <= 0.0 || config.auto_balance_max <= 0.0) {
+    throw std::invalid_argument("LsqRegistration: sparse anchor auto-balance limits must be finite and positive");
+  }
+
+  sparse_anchor_config_ = config;
+  if (sparse_anchor_config_.auto_balance_min > sparse_anchor_config_.auto_balance_max) {
+    std::swap(sparse_anchor_config_.auto_balance_min, sparse_anchor_config_.auto_balance_max);
+  }
+}
+
+template <typename PointTarget, typename PointSource>
+const SparseAnchorConfig& LsqRegistration<PointTarget, PointSource>::getSparseAnchorConfig() const {
+  return sparse_anchor_config_;
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setSparseAnchorObjectiveWeight(double weight) {
+  SparseAnchorConfig config = sparse_anchor_config_;
+  config.objective_weight = weight;
+  setSparseAnchorConfig(config);
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setSparseAnchorBalanceMode(SparseAnchorBalanceMode mode) {
+  sparse_anchor_config_.balance_mode = mode;
+}
+
+template <typename PointTarget, typename PointSource>
 void LsqRegistration<PointTarget, PointSource>::setSparseAnchorUsage(bool enable) {
   use_sparse_anchors_ = enable;
 }
@@ -255,6 +311,11 @@ double LsqRegistration<PointTarget, PointSource>::evaluateCost(const Eigen::Matr
     *b = system.gradient;
   }
   return system.cost;
+}
+
+template <typename PointTarget, typename PointSource>
+int LsqRegistration<PointTarget, PointSource>::current_geometric_term_count() const {
+  return input_ ? static_cast<int>(input_->size()) : 0;
 }
 
 template <typename PointTarget, typename PointSource>
@@ -323,11 +384,65 @@ typename LsqRegistration<PointTarget, PointSource>::PreparedLinearSystem LsqRegi
   const Eigen::Isometry3d& trans,
   bool force_observability_analysis) {
   PreparedLinearSystem system;
-  Matrix6 H = Matrix6::Zero();
-  Vector6 b = Vector6::Zero();
+  Matrix6 geometry_hessian = Matrix6::Zero();
+  Vector6 geometry_gradient = Vector6::Zero();
+  Matrix6 anchor_hessian = Matrix6::Zero();
+  Vector6 anchor_gradient = Vector6::Zero();
 
-  system.cost = linearize(trans, &H, &b);
-  system.cost += sparse_anchor_cost(trans, &H, &b);
+  system.geometry_raw_cost = linearize(trans, &geometry_hessian, &geometry_gradient);
+  system.anchor_raw_cost = sparse_anchor_cost(trans, &anchor_hessian, &anchor_gradient);
+
+  const Matrix6 geometry_hessian_sym = 0.5 * (geometry_hessian + geometry_hessian.transpose());
+  const Matrix6 anchor_hessian_sym = 0.5 * (anchor_hessian + anchor_hessian.transpose());
+
+  system.geometry_hessian_trace = detail::trace_on_unlocked_dofs(geometry_hessian_sym, observability_config_.hard_lock_mask);
+  system.anchor_hessian_trace = detail::trace_on_unlocked_dofs(anchor_hessian_sym, observability_config_.hard_lock_mask);
+  system.anchor_balance_factor = 1.0;
+  system.anchor_effective_scale = 0.0;
+  system.anchor_balance_fallback_used = false;
+
+  if (use_sparse_anchors_ && !sparse_anchor_source_points_.empty()) {
+    const auto clamp_factor = [this](double factor) {
+      return std::min(
+        sparse_anchor_config_.auto_balance_max,
+        std::max(sparse_anchor_config_.auto_balance_min, factor));
+    };
+
+    switch (sparse_anchor_config_.balance_mode) {
+      case SparseAnchorBalanceMode::NONE:
+        system.anchor_balance_factor = 1.0;
+        break;
+      case SparseAnchorBalanceMode::BY_COUNT: {
+        const int anchor_count = static_cast<int>(sparse_anchor_source_points_.size());
+        const int geometric_term_count = current_geometric_term_count();
+        if (anchor_count > 0 && geometric_term_count > 0) {
+          system.anchor_balance_factor =
+            clamp_factor(static_cast<double>(geometric_term_count) / static_cast<double>(anchor_count));
+        } else {
+          system.anchor_balance_factor = 1.0;
+          system.anchor_balance_fallback_used = true;
+        }
+        break;
+      }
+      case SparseAnchorBalanceMode::BY_HESSIAN_TRACE: {
+        if (std::isfinite(system.geometry_hessian_trace) && std::isfinite(system.anchor_hessian_trace) &&
+            system.geometry_hessian_trace > 1e-12 && system.anchor_hessian_trace > 1e-12) {
+          system.anchor_balance_factor = clamp_factor(system.geometry_hessian_trace / system.anchor_hessian_trace);
+        } else {
+          system.anchor_balance_factor = 1.0;
+          system.anchor_balance_fallback_used = true;
+        }
+        break;
+      }
+    }
+
+    system.anchor_effective_scale = sparse_anchor_config_.objective_weight * system.anchor_balance_factor;
+  }
+
+  system.cost = system.geometry_raw_cost + system.anchor_effective_scale * system.anchor_raw_cost;
+
+  Matrix6 H = geometry_hessian + system.anchor_effective_scale * anchor_hessian;
+  Vector6 b = geometry_gradient + system.anchor_effective_scale * anchor_gradient;
 
   system.raw_hessian = 0.5 * (H + H.transpose());
   system.regularized_hessian = system.raw_hessian;
@@ -339,46 +454,172 @@ typename LsqRegistration<PointTarget, PointSource>::PreparedLinearSystem LsqRegi
     return system;
   }
 
-  Eigen::SelfAdjointEigenSolver<Matrix6> eigen_solver(system.raw_hessian);
+  // --- Determine which Hessian to analyze for degeneracy ---
+  const Matrix6 analysis_hessian = observability_config_.analyze_geometry_separately
+    ? geometry_hessian_sym
+    : system.raw_hessian;
+
+  Eigen::SelfAdjointEigenSolver<Matrix6> eigen_solver(analysis_hessian);
   if (eigen_solver.info() != Eigen::Success) {
     store_observability_diagnostics(system);
     return system;
   }
 
-  system.eigenvalues = eigen_solver.eigenvalues();
+  const Vector6 analysis_eigenvalues = eigen_solver.eigenvalues();
+  const Matrix6 analysis_eigenvectors = eigen_solver.eigenvectors();
+
+  // Fill geometry-specific diagnostics when analyzing geometry separately
+  if (observability_config_.analyze_geometry_separately) {
+    system.geometry_eigenvalues = analysis_eigenvalues;
+    // Also eigendecompose the combined Hessian for reporting
+    Eigen::SelfAdjointEigenSolver<Matrix6> combined_solver(system.raw_hessian);
+    if (combined_solver.info() == Eigen::Success) {
+      system.eigenvalues = combined_solver.eigenvalues();
+    }
+  } else {
+    system.eigenvalues = analysis_eigenvalues;
+    system.geometry_eigenvalues = analysis_eigenvalues;  // same when not separate
+  }
+
   const double lambda_max = std::max(system.eigenvalues.maxCoeff(), observability_config_.absolute_eigenvalue_threshold);
+  const double analysis_lambda_max = std::max(analysis_eigenvalues.maxCoeff(), observability_config_.absolute_eigenvalue_threshold);
   const double eigen_threshold = std::max(
     observability_config_.absolute_eigenvalue_threshold,
-    observability_config_.relative_eigenvalue_threshold * lambda_max);
+    observability_config_.relative_eigenvalue_threshold * analysis_lambda_max);
 
+  // Compute rank and condition number from analysis Hessian
   std::vector<int> degenerate_columns;
   degenerate_columns.reserve(kLsqDof);
-  system.estimated_rank = 0;
+  int analysis_rank = 0;
   double smallest_kept = std::numeric_limits<double>::infinity();
   for (int i = 0; i < kLsqDof; i++) {
-    if (system.eigenvalues[i] > eigen_threshold) {
-      system.estimated_rank++;
-      smallest_kept = std::min(smallest_kept, system.eigenvalues[i]);
+    if (analysis_eigenvalues[i] > eigen_threshold) {
+      analysis_rank++;
+      smallest_kept = std::min(smallest_kept, analysis_eigenvalues[i]);
     } else {
       degenerate_columns.push_back(i);
     }
   }
 
-  if (system.estimated_rank == 0 || !std::isfinite(smallest_kept)) {
-    system.condition_number = std::numeric_limits<double>::infinity();
+  if (observability_config_.analyze_geometry_separately) {
+    system.geometry_estimated_rank = analysis_rank;
+    system.geometry_condition_number = (analysis_rank == 0 || !std::isfinite(smallest_kept))
+      ? std::numeric_limits<double>::infinity()
+      : analysis_lambda_max / smallest_kept;
+    // Combined rank/condition from combined eigenvalues
+    system.estimated_rank = 0;
+    double combined_smallest = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < kLsqDof; i++) {
+      if (system.eigenvalues[i] > eigen_threshold) {
+        system.estimated_rank++;
+        combined_smallest = std::min(combined_smallest, system.eigenvalues[i]);
+      }
+    }
+    system.condition_number = (system.estimated_rank == 0 || !std::isfinite(combined_smallest))
+      ? std::numeric_limits<double>::infinity()
+      : lambda_max / combined_smallest;
   } else {
-    system.condition_number = lambda_max / smallest_kept;
+    system.estimated_rank = analysis_rank;
+    system.geometry_estimated_rank = analysis_rank;
+    if (analysis_rank == 0 || !std::isfinite(smallest_kept)) {
+      system.condition_number = std::numeric_limits<double>::infinity();
+      system.geometry_condition_number = std::numeric_limits<double>::infinity();
+    } else {
+      system.condition_number = analysis_lambda_max / smallest_kept;
+      system.geometry_condition_number = system.condition_number;
+    }
   }
 
+  // Compute ambiguity scores from degenerate eigenvectors of analysis Hessian
   system.ambiguity_scores.setZero();
-  const Matrix6 eigenvectors = eigen_solver.eigenvectors();
   for (int column : degenerate_columns) {
-    system.ambiguity_scores.array() += eigenvectors.col(column).array().square();
+    system.ambiguity_scores.array() += analysis_eigenvectors.col(column).array().square();
   }
 
+  // === SMOOTH PRIOR PATH ===
   if (observability_config_.enable_observability_check &&
-      observability_config_.auto_soft_prior_strength > 0.0 &&
-      !degenerate_columns.empty()) {
+      observability_config_.use_smooth_prior) {
+
+    // Smooth per-eigenvalue weight: w(i) = 1 / (1 + (ratio/threshold)^falloff)
+    // Small eigenvalue -> ratio close to 0 -> weight close to 1 (more regularization)
+    // Large eigenvalue -> ratio >> threshold -> weight close to 0 (no regularization)
+    Vector6 per_eigval_weight;
+    for (int i = 0; i < kLsqDof; i++) {
+      double ratio = analysis_eigenvalues[i] / analysis_lambda_max;
+      double scaled = std::pow(
+        std::max(ratio, 1e-15) / observability_config_.relative_eigenvalue_threshold,
+        observability_config_.smooth_prior_falloff);
+      per_eigval_weight[i] = 1.0 / (1.0 + scaled);
+    }
+
+    // Transform eigenvalue-space weights to DOF-space weights
+    // dof_weight(j) = sum_i [ per_eigval_weight(i) * eigvec(j,i)^2 ]
+    Vector6 dof_weights = Vector6::Zero();
+    for (int i = 0; i < kLsqDof; i++) {
+      dof_weights.array() += per_eigval_weight[i] * analysis_eigenvectors.col(i).array().square();
+    }
+
+    // Determine regularization scale
+    double reg_scale;
+    switch (observability_config_.regularization_scale_mode) {
+      case 1:
+        // Scale relative to geometry Hessian trace (more stable)
+        reg_scale = std::max(system.geometry_hessian_trace / static_cast<double>(kLsqDof), 1e-12);
+        break;
+      case 2:
+        // Scale relative to diagonal mean of combined Hessian
+        reg_scale = std::max(system.raw_hessian.diagonal().mean(), 1e-12);
+        break;
+      default:
+        // Scale relative to lambda_max (original-like behavior)
+        reg_scale = std::max(analysis_lambda_max, 1e-12);
+        break;
+    }
+
+    // Anchor-aware reduction: if anchors provide information in degenerate directions,
+    // reduce the soft prior there
+    if (observability_config_.anchor_aware_regularization &&
+        use_sparse_anchors_ && !sparse_anchor_source_points_.empty() &&
+        system.anchor_effective_scale > 0.0) {
+      Eigen::SelfAdjointEigenSolver<Matrix6> anchor_solver(anchor_hessian_sym);
+      if (anchor_solver.info() == Eigen::Success) {
+        const Vector6 anchor_ev = anchor_solver.eigenvalues();
+        const Matrix6 anchor_eigvecs = anchor_solver.eigenvectors();
+
+        // Compute per-DOF anchor contribution normalized to analysis scale
+        Vector6 anchor_dof_strength = Vector6::Zero();
+        for (int i = 0; i < kLsqDof; i++) {
+          if (anchor_ev[i] > 1e-12) {
+            double anchor_ratio = anchor_ev[i] * system.anchor_effective_scale / analysis_lambda_max;
+            anchor_dof_strength.array() +=
+              std::min(anchor_ratio, 1.0) * anchor_eigvecs.col(i).array().square();
+          }
+        }
+
+        // Reduce regularization where anchors provide information
+        for (int i = 0; i < kLsqDof; i++) {
+          double reduction = 1.0 - std::min(anchor_dof_strength[i], 1.0);
+          dof_weights[i] *= reduction;
+        }
+      }
+    }
+
+    // Apply smooth regularization
+    const double max_reg = observability_config_.smooth_prior_max_strength * reg_scale;
+    for (int i = 0; i < kLsqDof; i++) {
+      if (observability_config_.hard_lock_mask[i]) continue;
+      double reg_amount = max_reg * dof_weights[i];
+      system.regularized_hessian(i, i) += reg_amount;
+      system.smooth_regularization_weights[i] = reg_amount;
+      if (dof_weights[i] > 0.01) {
+        system.auto_suppressed_mask[i] = 1;
+      }
+    }
+
+  } else if (observability_config_.enable_observability_check &&
+             observability_config_.auto_soft_prior_strength > 0.0 &&
+             !degenerate_columns.empty()) {
+    // === ORIGINAL BINARY OBSERVABILITY CHECK (backward compatible) ===
     std::vector<int> preferred_indices;
     std::vector<int> other_indices;
     preferred_indices.reserve(kLsqDof);
@@ -426,7 +667,7 @@ typename LsqRegistration<PointTarget, PointSource>::PreparedLinearSystem LsqRegi
 
     for (int idx : selected) {
       system.auto_suppressed_mask[idx] = 1;
-      system.regularized_hessian(idx, idx) += observability_config_.auto_soft_prior_strength * lambda_max * system.ambiguity_scores[idx];
+      system.regularized_hessian(idx, idx) += observability_config_.auto_soft_prior_strength * analysis_lambda_max * system.ambiguity_scores[idx];
     }
   }
 
@@ -520,6 +761,10 @@ void LsqRegistration<PointTarget, PointSource>::store_observability_diagnostics(
   observability_diagnostics_.ambiguity_scores = system.ambiguity_scores;
   observability_diagnostics_.condition_number = system.condition_number;
   observability_diagnostics_.estimated_rank = system.estimated_rank;
+  observability_diagnostics_.geometry_eigenvalues = system.geometry_eigenvalues;
+  observability_diagnostics_.smooth_regularization_weights = system.smooth_regularization_weights;
+  observability_diagnostics_.geometry_estimated_rank = system.geometry_estimated_rank;
+  observability_diagnostics_.geometry_condition_number = system.geometry_condition_number;
 
   for (int i = 0; i < kLsqDof; i++) {
     observability_diagnostics_.auto_suppressed_mask[i] = system.auto_suppressed_mask[i];
@@ -548,8 +793,21 @@ void LsqRegistration<PointTarget, PointSource>::fill_alignment_quality_report(
   report.condition_number = system.condition_number;
   report.ambiguity_scores = system.ambiguity_scores;
   report.max_ambiguity = system.ambiguity_scores.maxCoeff();
+  report.anchor_objective_weight = sparse_anchor_config_.objective_weight;
+  report.anchor_balance_mode = sparse_anchor_config_.balance_mode;
+  report.anchor_auto_balance_factor = system.anchor_balance_factor;
+  report.anchor_effective_scale = system.anchor_effective_scale;
+  report.geometry_raw_cost = system.geometry_raw_cost;
+  report.anchor_raw_cost = system.anchor_raw_cost;
+  report.anchor_scaled_cost = system.anchor_effective_scale * system.anchor_raw_cost;
+  report.geometry_hessian_trace = system.geometry_hessian_trace;
+  report.anchor_hessian_trace = system.anchor_hessian_trace;
+  report.anchor_balance_fallback_used = system.anchor_balance_fallback_used;
   report.auto_suppressed_mask = Eigen::Map<const Eigen::Matrix<int, kLsqDof, 1>>(system.auto_suppressed_mask.data());
   report.hard_lock_mask = Eigen::Map<const Eigen::Matrix<int, kLsqDof, 1>>(observability_config_.hard_lock_mask.data());
+  report.smooth_regularization_weights = system.smooth_regularization_weights;
+  report.geometry_rank = system.geometry_estimated_rank;
+  report.geometry_condition_number = system.geometry_condition_number;
 
   if (input_ != nullptr && target_ != nullptr && !input_->empty() && !target_->empty()) {
     report.fitness_score = this->getFitnessScore();
@@ -789,7 +1047,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
     delta.translation() = d.tail<3>();
 
     Eigen::Isometry3d xi = apply_hard_locks_to_pose(x0, delta * x0);
-    double yi = compute_error(xi) + sparse_anchor_cost(xi);
+    double yi = compute_error(xi) + system.anchor_effective_scale * sparse_anchor_cost(xi);
 
     Vector6 damping = Vector6::Zero();
     for (int dof = 0; dof < kLsqDof; dof++) {

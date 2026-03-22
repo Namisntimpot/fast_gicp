@@ -77,6 +77,10 @@ public:
   void setAlignmentQualityConfig(const AlignmentQualityConfig& config);
   const AlignmentQualityConfig& getAlignmentQualityConfig() const;
   const AlignmentQualityReport& getAlignmentQualityReport() const;
+  void setSparseAnchorConfig(const SparseAnchorConfig& config);
+  const SparseAnchorConfig& getSparseAnchorConfig() const;
+  void setSparseAnchorObjectiveWeight(double weight);
+  void setSparseAnchorBalanceMode(SparseAnchorBalanceMode mode);
   void setSparseAnchorUsage(bool enable);
   void setSparseAnchorCorrespondences(
     const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& source_points,
@@ -115,11 +119,24 @@ protected:
     int estimated_rank = kLsqDof;
     double condition_number = 1.0;
     double cost = 0.0;
+    double geometry_raw_cost = 0.0;
+    double anchor_raw_cost = 0.0;
+    double anchor_effective_scale = 0.0;
+    double anchor_balance_factor = 1.0;
+    double geometry_hessian_trace = 0.0;
+    double anchor_hessian_trace = 0.0;
+    bool anchor_balance_fallback_used = false;
+    // Smooth prior fields
+    Vector6 geometry_eigenvalues = Vector6::Zero();
+    Vector6 smooth_regularization_weights = Vector6::Zero();
+    int geometry_estimated_rank = kLsqDof;
+    double geometry_condition_number = 1.0;
   };
 
   PreparedLinearSystem build_linearized_system(const Eigen::Isometry3d& trans, bool force_observability_analysis = false);
   Vector6 solve_linearized_system(const Matrix6& H, const Vector6& b, const std::array<int, kLsqDof>& hard_lock_mask) const;
   double sparse_anchor_cost(const Eigen::Isometry3d& trans, Matrix6* H = nullptr, Vector6* b = nullptr) const;
+  virtual int current_geometric_term_count() const;
   void store_observability_diagnostics(const PreparedLinearSystem& system);
   Eigen::Isometry3d apply_hard_locks_to_pose(const Eigen::Isometry3d& previous_pose, const Eigen::Isometry3d& candidate_pose) const;
   void fill_alignment_quality_report(const PreparedLinearSystem& system, const Eigen::Isometry3d& final_pose);
@@ -143,6 +160,7 @@ protected:
   ObservabilityDiagnostics observability_diagnostics_;
   AlignmentQualityConfig alignment_quality_config_;
   AlignmentQualityReport alignment_quality_report_;
+  SparseAnchorConfig sparse_anchor_config_;
 
   bool use_sparse_anchors_;
   std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> sparse_anchor_source_points_;

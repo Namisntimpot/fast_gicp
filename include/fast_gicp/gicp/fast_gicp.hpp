@@ -123,6 +123,7 @@ protected:
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
   bool color_matching_ready() const;
   double color_distance_score(int source_index, int target_index) const;
+  virtual int current_geometric_term_count() const override;
   virtual void collect_alignment_quality_metrics(
     AlignmentQualityReport* report,
     const Eigen::Isometry3d& final_pose) const override;

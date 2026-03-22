@@ -332,6 +332,48 @@ TEST(RobustGICPTest, SparseAnchorsBiasAmbiguousTranslation) {
   EXPECT_GT(anchor_z, 0.1);
 }
 
+TEST(RobustGICPTest, SparseAnchorBalanceModesIncreaseAnchorInfluence) {
+  auto target = make_vertical_plane();
+  auto source = make_vertical_plane();
+
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_anchors;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> target_anchors;
+  std::vector<double> weights;
+  for (int index : {8, 120}) {
+    const auto& point = source->at(index);
+    source_anchors.emplace_back(point.x, point.y, point.z);
+    target_anchors.emplace_back(point.x, point.y, point.z + 0.2);
+    weights.push_back(0.25);
+  }
+
+  auto run_case = [&](fast_gicp::SparseAnchorBalanceMode mode, double objective_weight) {
+    fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+    reg.setInputTarget(target);
+    reg.setInputSource(source);
+    reg.setMaxCorrespondenceDistance(1.0);
+    reg.setSparseAnchorCorrespondences(source_anchors, target_anchors, weights);
+
+    fast_gicp::SparseAnchorConfig config;
+    config.balance_mode = mode;
+    config.objective_weight = objective_weight;
+    reg.setSparseAnchorConfig(config);
+
+    pcl::PointCloud<pcl::PointXYZ> aligned;
+    reg.align(aligned);
+    return std::make_pair(reg.getFinalTransformation()(2, 3), reg.getAlignmentQualityReport());
+  };
+
+  const auto none_case = run_case(fast_gicp::SparseAnchorBalanceMode::NONE, 1.0);
+  const auto count_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_COUNT, 1.0);
+  const auto trace_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 1.0);
+  const auto zero_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 0.0);
+
+  EXPECT_LT(std::abs(zero_case.first), 0.05);
+  EXPECT_GT(count_case.first, none_case.first + 0.02);
+  EXPECT_GT(trace_case.first, none_case.first + 0.02);
+  EXPECT_EQ(trace_case.second.anchor_balance_mode, fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE);
+}
+
 TEST(RobustGICPTest, ColorMatchingChangesCorrespondenceSelection) {
   auto target = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   target->push_back(pcl::PointXYZ(0.05f, 0.0f, 0.0f));

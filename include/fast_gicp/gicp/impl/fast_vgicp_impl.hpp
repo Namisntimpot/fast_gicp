@@ -266,6 +266,11 @@ double FastVGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3
 }
 
 template <typename PointSource, typename PointTarget>
+int FastVGICP<PointSource, PointTarget>::current_geometric_term_count() const {
+  return static_cast<int>(voxel_correspondences_.size());
+}
+
+template <typename PointSource, typename PointTarget>
 void FastVGICP<PointSource, PointTarget>::collect_alignment_quality_metrics(
   AlignmentQualityReport* report,
   const Eigen::Isometry3d& final_pose) const {

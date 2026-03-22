@@ -129,6 +129,47 @@ fast_gicp::ColorMatchingConfig color_matching_config_from_args(bool enabled, int
   return config;
 }
 
+std::string sparse_anchor_balance_mode_name(fast_gicp::SparseAnchorBalanceMode mode) {
+  switch (mode) {
+    case fast_gicp::SparseAnchorBalanceMode::NONE:
+      return "NONE";
+    case fast_gicp::SparseAnchorBalanceMode::BY_COUNT:
+      return "BY_COUNT";
+    case fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE:
+      return "BY_HESSIAN_TRACE";
+  }
+
+  return "NONE";
+}
+
+fast_gicp::SparseAnchorBalanceMode sparse_anchor_balance_mode(const py::handle& value) {
+  if (py::isinstance<py::str>(value)) {
+    const std::string mode = py::cast<std::string>(value);
+    if (mode == "NONE") {
+      return fast_gicp::SparseAnchorBalanceMode::NONE;
+    }
+    if (mode == "BY_COUNT") {
+      return fast_gicp::SparseAnchorBalanceMode::BY_COUNT;
+    }
+    if (mode == "BY_HESSIAN_TRACE") {
+      return fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE;
+    }
+    throw std::invalid_argument("unknown sparse anchor balance mode: " + mode);
+  }
+
+  const int mode = py::cast<int>(value);
+  switch (mode) {
+    case 0:
+      return fast_gicp::SparseAnchorBalanceMode::NONE;
+    case 1:
+      return fast_gicp::SparseAnchorBalanceMode::BY_COUNT;
+    case 2:
+      return fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE;
+    default:
+      throw std::invalid_argument("unknown sparse anchor balance mode index");
+  }
+}
+
 std::array<double, fast_gicp::kLsqDof> sequence_to_dof_thresholds(const py::handle& value) {
   py::sequence seq = value.cast<py::sequence>();
   if (py::len(seq) != fast_gicp::kLsqDof) {
@@ -163,6 +204,36 @@ py::dict alignment_quality_config_to_dict(const fast_gicp::AlignmentQualityConfi
   info["max_anchor_mean_residual"] = config.max_anchor_mean_residual;
   info["max_anchor_p95_residual"] = config.max_anchor_p95_residual;
   return info;
+}
+
+py::dict sparse_anchor_config_to_dict(const fast_gicp::SparseAnchorConfig& config) {
+  py::dict info;
+  info["objective_weight"] = config.objective_weight;
+  info["balance_mode"] = sparse_anchor_balance_mode_name(config.balance_mode);
+  info["auto_balance_min"] = config.auto_balance_min;
+  info["auto_balance_max"] = config.auto_balance_max;
+  return info;
+}
+
+void update_sparse_anchor_config_from_dict(
+  fast_gicp::SparseAnchorConfig* config,
+  const py::dict& options) {
+  for (auto item : options) {
+    const std::string key = py::cast<std::string>(item.first);
+    const py::handle value = item.second;
+
+    if (key == "objective_weight") {
+      config->objective_weight = py::cast<double>(value);
+    } else if (key == "balance_mode") {
+      config->balance_mode = sparse_anchor_balance_mode(value);
+    } else if (key == "auto_balance_min") {
+      config->auto_balance_min = py::cast<double>(value);
+    } else if (key == "auto_balance_max") {
+      config->auto_balance_max = py::cast<double>(value);
+    } else {
+      throw std::invalid_argument("unknown sparse anchor config key: " + key);
+    }
+  }
 }
 
 void update_alignment_quality_config_from_dict(
@@ -244,9 +315,22 @@ py::dict alignment_quality_report_to_dict(const fast_gicp::AlignmentQualityRepor
   info["max_ambiguity"] = report.max_ambiguity;
   info["anchor_mean_residual"] = report.anchor_mean_residual;
   info["anchor_p95_residual"] = report.anchor_p95_residual;
+  info["anchor_objective_weight"] = report.anchor_objective_weight;
+  info["anchor_balance_mode"] = sparse_anchor_balance_mode_name(report.anchor_balance_mode);
+  info["anchor_auto_balance_factor"] = report.anchor_auto_balance_factor;
+  info["anchor_effective_scale"] = report.anchor_effective_scale;
+  info["geometry_raw_cost"] = report.geometry_raw_cost;
+  info["anchor_raw_cost"] = report.anchor_raw_cost;
+  info["anchor_scaled_cost"] = report.anchor_scaled_cost;
+  info["geometry_hessian_trace"] = report.geometry_hessian_trace;
+  info["anchor_hessian_trace"] = report.anchor_hessian_trace;
+  info["anchor_balance_fallback_used"] = report.anchor_balance_fallback_used;
   info["ambiguity_scores"] = dof_scores_to_numpy(report.ambiguity_scores);
   info["auto_suppressed_mask"] = dof_mask_to_numpy(report.auto_suppressed_mask);
   info["hard_lock_mask"] = dof_mask_to_numpy(report.hard_lock_mask);
+  info["smooth_regularization_weights"] = dof_scores_to_numpy(report.smooth_regularization_weights);
+  info["geometry_rank"] = report.geometry_rank;
+  info["geometry_condition_number"] = report.geometry_condition_number;
   info["rejection_reasons"] = report.rejection_reasons;
   return info;
 }
@@ -411,10 +495,50 @@ PYBIND11_MODULE(pygicp, m) {
     .def("set_preferred_ambiguous_mask", [] (LsqRegistration& reg, const py::array& mask) { reg.setPreferredAmbiguousMask(numpy_to_dof_mask(mask)); })
     .def("set_prefer_user_marked_dofs", &LsqRegistration::setPreferUserMarkedDofs)
     .def("set_enable_observability_diagnostics", &LsqRegistration::setEnableObservabilityDiagnostics)
+    // Smooth prior setters
+    .def("set_use_smooth_prior", [](LsqRegistration& reg, bool enable) {
+      auto config = reg.getObservabilityConfig();
+      config.use_smooth_prior = enable;
+      reg.setObservabilityConfig(config);
+    })
+    .def("set_smooth_prior_falloff", [](LsqRegistration& reg, double falloff) {
+      auto config = reg.getObservabilityConfig();
+      config.smooth_prior_falloff = falloff;
+      reg.setObservabilityConfig(config);
+    })
+    .def("set_smooth_prior_max_strength", [](LsqRegistration& reg, double strength) {
+      auto config = reg.getObservabilityConfig();
+      config.smooth_prior_max_strength = strength;
+      reg.setObservabilityConfig(config);
+    })
+    .def("set_analyze_geometry_separately", [](LsqRegistration& reg, bool enable) {
+      auto config = reg.getObservabilityConfig();
+      config.analyze_geometry_separately = enable;
+      reg.setObservabilityConfig(config);
+    })
+    .def("set_anchor_aware_regularization", [](LsqRegistration& reg, bool enable) {
+      auto config = reg.getObservabilityConfig();
+      config.anchor_aware_regularization = enable;
+      reg.setObservabilityConfig(config);
+    })
+    .def("set_regularization_scale_mode", [](LsqRegistration& reg, int mode) {
+      auto config = reg.getObservabilityConfig();
+      config.regularization_scale_mode = mode;
+      reg.setObservabilityConfig(config);
+    })
     .def("set_alignment_quality_config", [] (LsqRegistration& reg, const py::dict& options) {
       auto config = reg.getAlignmentQualityConfig();
       update_alignment_quality_config_from_dict(&config, options);
       reg.setAlignmentQualityConfig(config);
+    })
+    .def("set_sparse_anchor_config", [] (LsqRegistration& reg, const py::dict& options) {
+      auto config = reg.getSparseAnchorConfig();
+      update_sparse_anchor_config_from_dict(&config, options);
+      reg.setSparseAnchorConfig(config);
+    })
+    .def("set_sparse_anchor_objective_weight", &LsqRegistration::setSparseAnchorObjectiveWeight)
+    .def("set_sparse_anchor_balance_mode", [] (LsqRegistration& reg, const py::object& mode) {
+      reg.setSparseAnchorBalanceMode(sparse_anchor_balance_mode(mode));
     })
     .def("set_use_sparse_anchors", &LsqRegistration::setSparseAnchorUsage)
     .def("set_sparse_anchor_correspondences", [] (LsqRegistration& reg, const py::array& source_points, const py::array& target_points, const py::object& weights, const py::object& sigmas) {
@@ -440,10 +564,19 @@ PYBIND11_MODULE(pygicp, m) {
       info["preferred_ambiguous_mask"] = py::cast(std::vector<int>(config.preferred_ambiguous_mask.begin(), config.preferred_ambiguous_mask.end()));
       info["prefer_user_marked_dofs"] = config.prefer_user_marked_dofs;
       info["enable_diagnostics"] = config.enable_diagnostics;
+      info["use_smooth_prior"] = config.use_smooth_prior;
+      info["smooth_prior_falloff"] = config.smooth_prior_falloff;
+      info["smooth_prior_max_strength"] = config.smooth_prior_max_strength;
+      info["analyze_geometry_separately"] = config.analyze_geometry_separately;
+      info["anchor_aware_regularization"] = config.anchor_aware_regularization;
+      info["regularization_scale_mode"] = config.regularization_scale_mode;
       return info;
     })
     .def("get_alignment_quality_config", [] (LsqRegistration& reg) {
       return alignment_quality_config_to_dict(reg.getAlignmentQualityConfig());
+    })
+    .def("get_sparse_anchor_config", [] (LsqRegistration& reg) {
+      return sparse_anchor_config_to_dict(reg.getSparseAnchorConfig());
     })
     .def("get_observability_diagnostics", [] (LsqRegistration& reg) {
       const auto& diagnostics = reg.getObservabilityDiagnostics();
@@ -457,6 +590,10 @@ PYBIND11_MODULE(pygicp, m) {
       info["preferred_ambiguous_mask"] = dof_mask_to_numpy(diagnostics.preferred_ambiguous_mask);
       info["condition_number"] = diagnostics.condition_number;
       info["estimated_rank"] = diagnostics.estimated_rank;
+      info["geometry_eigenvalues"] = diagnostics.geometry_eigenvalues;
+      info["smooth_regularization_weights"] = diagnostics.smooth_regularization_weights;
+      info["geometry_estimated_rank"] = diagnostics.geometry_estimated_rank;
+      info["geometry_condition_number"] = diagnostics.geometry_condition_number;
       return info;
     })
     .def("get_alignment_quality_report", [] (LsqRegistration& reg) {

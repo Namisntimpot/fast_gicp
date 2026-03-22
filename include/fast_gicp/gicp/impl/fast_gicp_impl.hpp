@@ -485,6 +485,14 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+int FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::current_geometric_term_count() const {
+  return static_cast<int>(std::count_if(
+    correspondences_.begin(),
+    correspondences_.end(),
+    [](int index) { return index >= 0; }));
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::collect_alignment_quality_metrics(
   AlignmentQualityReport* report,
   const Eigen::Isometry3d& final_pose) const {

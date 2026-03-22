@@ -70,6 +70,7 @@ public:
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
   virtual void update_correspondences(const Eigen::Isometry3d& trans) override;
+  virtual int current_geometric_term_count() const override;
   virtual void collect_alignment_quality_metrics(
     AlignmentQualityReport* report,
     const Eigen::Isometry3d& final_pose) const override;

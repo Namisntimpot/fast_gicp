@@ -379,6 +379,60 @@ void run_alignment_quality_anchor_and_vgicp_check() {
   expect_true(vgicp_report.matched_count > 0, "FastVGICP should match at least one point");
 }
 
+void run_sparse_anchor_balance_mode_check() {
+  auto target = make_vertical_plane();
+  auto source = make_vertical_plane();
+
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_anchors;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> target_anchors;
+  std::vector<double> weights;
+  for (int index : {8, 120}) {
+    const auto& point = source->at(index);
+    source_anchors.emplace_back(point.x, point.y, point.z);
+    target_anchors.emplace_back(point.x, point.y, point.z + 0.2);
+    weights.push_back(0.25);
+  }
+
+  auto run_case = [&](fast_gicp::SparseAnchorBalanceMode mode, double objective_weight) {
+    fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+    reg.setInputTarget(target);
+    reg.setInputSource(source);
+    reg.setMaxCorrespondenceDistance(1.0);
+    reg.setSparseAnchorCorrespondences(source_anchors, target_anchors, weights);
+
+    fast_gicp::SparseAnchorConfig config;
+    config.balance_mode = mode;
+    config.objective_weight = objective_weight;
+    reg.setSparseAnchorConfig(config);
+
+    Cloud aligned;
+    reg.align(aligned);
+    return std::make_pair(reg.getFinalTransformation()(2, 3), reg.getAlignmentQualityReport());
+  };
+
+  const auto none_case = run_case(fast_gicp::SparseAnchorBalanceMode::NONE, 1.0);
+  const auto count_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_COUNT, 1.0);
+  const auto trace_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 1.0);
+  const auto zero_weight_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 0.0);
+  const auto strong_weight_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 5.0);
+
+  expect_true(std::abs(zero_weight_case.first) < 0.05, "zero anchor objective weight should behave like no anchor constraint");
+  expect_true(count_case.first > none_case.first + 0.02, "BY_COUNT should strengthen sparse anchors relative to NONE");
+  expect_true(trace_case.first > none_case.first + 0.02, "BY_HESSIAN_TRACE should strengthen sparse anchors relative to NONE");
+  expect_true(
+    strong_weight_case.second.anchor_effective_scale > trace_case.second.anchor_effective_scale,
+    "larger anchor objective weight should increase anchor effective scale");
+  expect_true(
+    strong_weight_case.first > none_case.first + 0.02,
+    "larger anchor objective weight should still strengthen sparse anchors relative to NONE");
+
+  expect_true(none_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::NONE, "report should expose NONE balance mode");
+  expect_true(count_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::BY_COUNT, "report should expose BY_COUNT balance mode");
+  expect_true(trace_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, "report should expose BY_HESSIAN_TRACE balance mode");
+  expect_true(std::isfinite(trace_case.second.anchor_effective_scale), "anchor effective scale should be finite");
+  expect_true(std::isfinite(trace_case.second.geometry_hessian_trace), "geometry hessian trace should be finite");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -399,6 +453,8 @@ int main(int argc, char** argv) {
     run_alignment_quality_gating_check();
     std::cout << "[RUN] alignment quality anchor/vgicp" << std::endl;
     run_alignment_quality_anchor_and_vgicp_check();
+    std::cout << "[RUN] sparse anchor balance modes" << std::endl;
+    run_sparse_anchor_balance_mode_check();
   } catch (const std::exception& e) {
     std::cerr << "[FAIL] " << e.what() << std::endl;
     return 1;
