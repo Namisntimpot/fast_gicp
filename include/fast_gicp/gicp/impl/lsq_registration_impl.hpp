@@ -84,6 +84,8 @@ inline const char* sparse_anchor_balance_mode_name(SparseAnchorBalanceMode mode)
       return "BY_COUNT";
     case SparseAnchorBalanceMode::BY_HESSIAN_TRACE:
       return "BY_HESSIAN_TRACE";
+    case SparseAnchorBalanceMode::AUTO:
+      return "AUTO";
   }
 
   return "NONE";
@@ -432,6 +434,63 @@ typename LsqRegistration<PointTarget, PointSource>::PreparedLinearSystem LsqRegi
           system.anchor_balance_factor = 1.0;
           system.anchor_balance_fallback_used = true;
         }
+        break;
+      }
+      case SparseAnchorBalanceMode::AUTO: {
+        const int anchor_count = static_cast<int>(sparse_anchor_source_points_.size());
+        const int geometric_term_count = current_geometric_term_count();
+        if (anchor_count <= 0 || geometric_term_count <= 0) {
+          system.anchor_balance_factor = 1.0;
+          system.anchor_balance_fallback_used = true;
+          break;
+        }
+
+        Eigen::SelfAdjointEigenSolver<Matrix6> geometry_solver(geometry_hessian_sym);
+        if (geometry_solver.info() != Eigen::Success) {
+          system.anchor_balance_factor = 1.0;
+          system.anchor_balance_fallback_used = true;
+          break;
+        }
+
+        const Vector6 geometry_eigenvalues = geometry_solver.eigenvalues();
+        const Matrix6 geometry_eigenvectors = geometry_solver.eigenvectors();
+        const double lambda_max = std::max(
+          geometry_eigenvalues.maxCoeff(),
+          observability_config_.absolute_eigenvalue_threshold);
+        const double eigen_threshold = std::max(
+          observability_config_.absolute_eigenvalue_threshold,
+          observability_config_.relative_eigenvalue_threshold * lambda_max);
+
+        int geometry_rank = 0;
+        Vector6 ambiguity_scores = Vector6::Zero();
+        for (int i = 0; i < kLsqDof; i++) {
+          if (geometry_eigenvalues[i] > eigen_threshold) {
+            geometry_rank++;
+          } else {
+            ambiguity_scores.array() += geometry_eigenvectors.col(i).array().square();
+          }
+        }
+
+        if (geometry_rank >= kLsqDof) {
+          system.anchor_balance_factor = 1.0;
+          break;
+        }
+
+        const double ambiguity_threshold = std::min(
+          0.95,
+          std::max(0.0, sparse_anchor_config_.auto_ambiguity_floor));
+        const double max_ambiguity = ambiguity_scores.maxCoeff();
+        const double ambiguity_boost = std::max(
+          0.5,
+          std::max(0.0, max_ambiguity - ambiguity_threshold) /
+            std::max(1e-6, 1.0 - ambiguity_threshold));
+        const double count_ratio =
+          static_cast<double>(geometric_term_count) / static_cast<double>(anchor_count);
+        system.anchor_balance_factor =
+          clamp_factor(
+            1.0 +
+            sparse_anchor_config_.auto_ambiguity_gain * ambiguity_boost *
+              std::pow(std::max(1.0, count_ratio), sparse_anchor_config_.auto_count_power));
         break;
       }
     }

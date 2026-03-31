@@ -169,6 +169,61 @@ void run_alignment_regression() {
   }
 }
 
+void run_builtin_dataset_default_parity_check() {
+  const Dataset dataset = load_dataset("data");
+
+  auto run_case = [&](const std::function<void(fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ>&)>& configure) {
+    fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+    reg.setNumThreads(1);
+    reg.setInputTarget(dataset.target);
+    reg.setInputSource(dataset.source);
+    reg.setMaxCorrespondenceDistance(2.0);
+    configure(reg);
+
+    Cloud aligned;
+    reg.align(aligned);
+    return std::make_pair(reg.getFinalTransformation(), reg.getFitnessScore());
+  };
+
+  const auto default_reg = run_case([](auto&) {});
+  const auto main_like_reg = run_case([](auto& reg) {
+    reg.setCorrespondenceRandomness(25);
+    reg.setKNNMaxDistance(0.0f);
+  });
+
+  expect_true(default_reg.first.array().isFinite().all(), "default FastGICP should produce a finite transform on builtin data");
+  expect_true(main_like_reg.first.array().isFinite().all(), "main-like FastGICP should produce a finite transform on builtin data");
+
+  const Eigen::Vector2f default_error = pose_error(dataset.relative_pose, default_reg.first);
+  const Eigen::Vector2f main_like_error = pose_error(dataset.relative_pose, main_like_reg.first);
+  const Eigen::Vector2f delta_error = pose_error(main_like_reg.first, default_reg.first);
+
+  expect_true(default_error[0] < 0.05 && default_error[1] < 1.0 * M_PI / 180.0, "default FastGICP should remain accurate on builtin data");
+  expect_true(main_like_error[0] < 0.05 && main_like_error[1] < 1.0 * M_PI / 180.0, "main-like FastGICP should remain accurate on builtin data");
+  expect_true(delta_error[0] < 5e-3f, "default FastGICP translation should match explicit main-like settings");
+  expect_true(delta_error[1] < 0.1f * M_PI / 180.0f, "default FastGICP rotation should match explicit main-like settings");
+  expect_near(default_reg.second, main_like_reg.second, 1e-3, "default FastGICP fitness should match explicit main-like settings");
+}
+
+void run_knn_max_distance_check() {
+  const Dataset dataset = load_dataset("data");
+
+  fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ> reg;
+  reg.setNumThreads(1);
+  reg.setInputTarget(dataset.target);
+  reg.setInputSource(dataset.source);
+  reg.setMaxCorrespondenceDistance(2.0);
+  reg.setKNNMaxDistance(1.0f);
+
+  Cloud aligned;
+  reg.align(aligned);
+
+  const Eigen::Vector2f error = pose_error(dataset.relative_pose, reg.getFinalTransformation());
+  expect_true(reg.getFinalTransformation().array().isFinite().all(), "KNN-limited FastGICP should produce a finite transform");
+  expect_true(std::isfinite(reg.getFitnessScore()), "KNN-limited FastGICP fitness should be finite");
+  expect_true(error[0] < 0.3 && error[1] < 5.0 * M_PI / 180.0, "KNN-limited FastGICP should remain finite and bounded on builtin data");
+}
+
 void run_observability_checks() {
   auto target = pcl::make_shared<Cloud>();
   target->push_back(pcl::PointXYZ(0.0f, 0.0f, 1.0f));
@@ -411,6 +466,7 @@ void run_sparse_anchor_balance_mode_check() {
   };
 
   const auto none_case = run_case(fast_gicp::SparseAnchorBalanceMode::NONE, 1.0);
+  const auto auto_case = run_case(fast_gicp::SparseAnchorBalanceMode::AUTO, 1.0);
   const auto count_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_COUNT, 1.0);
   const auto trace_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 1.0);
   const auto zero_weight_case = run_case(fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, 0.0);
@@ -427,8 +483,15 @@ void run_sparse_anchor_balance_mode_check() {
     "larger anchor objective weight should still strengthen sparse anchors relative to NONE");
 
   expect_true(none_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::NONE, "report should expose NONE balance mode");
+  expect_true(auto_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::AUTO, "report should expose AUTO balance mode");
   expect_true(count_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::BY_COUNT, "report should expose BY_COUNT balance mode");
   expect_true(trace_case.second.anchor_balance_mode == fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE, "report should expose BY_HESSIAN_TRACE balance mode");
+  expect_true(
+    auto_case.second.anchor_effective_scale > none_case.second.anchor_effective_scale,
+    "AUTO should increase anchor effective scale relative to NONE on ambiguous geometry");
+  expect_true(
+    auto_case.first >= none_case.first - 1e-4,
+    "AUTO should not weaken sparse anchors relative to NONE on ambiguous geometry");
   expect_true(std::isfinite(trace_case.second.anchor_effective_scale), "anchor effective scale should be finite");
   expect_true(std::isfinite(trace_case.second.geometry_hessian_trace), "geometry hessian trace should be finite");
 }
@@ -439,6 +502,10 @@ int main(int argc, char** argv) {
   try {
     std::cout << "[RUN] alignment regression" << std::endl;
     run_alignment_regression();
+    std::cout << "[RUN] builtin dataset default parity" << std::endl;
+    run_builtin_dataset_default_parity_check();
+    std::cout << "[RUN] knn max distance" << std::endl;
+    run_knn_max_distance_check();
     std::cout << "[RUN] observability" << std::endl;
     run_observability_checks();
     std::cout << "[RUN] hard lock" << std::endl;

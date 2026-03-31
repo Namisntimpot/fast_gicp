@@ -33,6 +33,48 @@ inline double percentile_from_sorted(const std::vector<double>& values, double q
   return (1.0 - t) * values[lower] + t * values[upper];
 }
 
+inline float effective_knn_distance_sq_threshold(float knn_max_distance) {
+  if (std::isfinite(knn_max_distance) && knn_max_distance > 0.0f) {
+    return knn_max_distance * knn_max_distance;
+  }
+
+  return std::numeric_limits<float>::infinity();
+}
+
+inline std::vector<int> select_reliable_neighbor_indices(
+  const std::vector<int>& k_indices,
+  const std::vector<float>& k_sq_distances,
+  float knn_max_distance) {
+  std::vector<int> selected;
+  selected.reserve(k_indices.size());
+
+  const float max_sq_distance = effective_knn_distance_sq_threshold(knn_max_distance);
+  for (std::size_t j = 0; j < k_indices.size(); j++) {
+    if (k_sq_distances[j] <= max_sq_distance) {
+      selected.push_back(k_indices[j]);
+    }
+  }
+
+  if (selected.empty() && !k_indices.empty()) {
+    selected.push_back(k_indices.front());
+  }
+
+  return selected;
+}
+
+template <typename PointT>
+Eigen::Matrix4d covariance_from_neighbors(
+  const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
+  const std::vector<int>& neighbor_indices) {
+  Eigen::Matrix<double, 4, -1> neighbors(4, neighbor_indices.size());
+  for (std::size_t j = 0; j < neighbor_indices.size(); j++) {
+    neighbors.col(j) = cloud->at(neighbor_indices[j]).getVector4fMap().template cast<double>();
+  }
+
+  neighbors.colwise() -= neighbors.rowwise().mean().eval();
+  return neighbors * neighbors.transpose() / static_cast<double>(neighbor_indices.size());
+}
+
 }  // namespace detail_fast_gicp
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -43,10 +85,10 @@ FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::Fast
   num_threads_ = 1;
 #endif
 
-  k_correspondences_ = 10;  //25
+  k_correspondences_ = 25;
   reg_name_ = "FastGICP";
   corr_dist_threshold_ = std::numeric_limits<float>::max();
-  knn_max_distance_ = 0.5;
+  knn_max_distance_ = -1.0f;
   
   source_covs_.clear();  
   source_rotationsq_.clear();
@@ -80,7 +122,7 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setKNNMaxDistance(float k) {
-  knn_max_distance_ = k;
+  knn_max_distance_ = k > 0.0f ? k : -1.0f;
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -553,25 +595,10 @@ bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   for (int i = 0; i < cloud->size(); i++) {
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
-    int num_reliable_neighbors = 0;
     kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-
-    // Get number of reliable neighbors
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        ++num_reliable_neighbors;
-      }
-    }
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, num_reliable_neighbors);
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
-      }
-    }
-
-    neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    const auto reliable_neighbors =
+      detail_fast_gicp::select_reliable_neighbor_indices(k_indices, k_sq_distances, knn_max_distance_);
+    Eigen::Matrix4d cov = detail_fast_gicp::covariance_from_neighbors<PointT>(cloud, reliable_neighbors);
     
     //compute raw scale and quaternions using cov
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -655,25 +682,10 @@ bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   for (int i = 0; i < cloud->size(); i++) {
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
-    int num_reliable_neighbors = 0;
     kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-
-    // Get number of reliable neighbors
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        ++num_reliable_neighbors;
-      }
-    }
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, num_reliable_neighbors);
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
-      }
-    }
-
-    neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    const auto reliable_neighbors =
+      detail_fast_gicp::select_reliable_neighbor_indices(k_indices, k_sq_distances, knn_max_distance_);
+    Eigen::Matrix4d cov = detail_fast_gicp::covariance_from_neighbors<PointT>(cloud, reliable_neighbors);
     
     //compute raw scale and quaternions using cov
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -768,27 +780,10 @@ bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   for (int i = 0; i < cloud->size(); i++) {
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
-    int num_reliable_neighbors = 0;
     kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-    
-    // Get number of reliable neighbors
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        ++num_reliable_neighbors;
-      }
-    }
-
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, num_reliable_neighbors);
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
-      }
-    }
-
-    
-    neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    const auto reliable_neighbors =
+      detail_fast_gicp::select_reliable_neighbor_indices(k_indices, k_sq_distances, knn_max_distance_);
+    Eigen::Matrix4d cov = detail_fast_gicp::covariance_from_neighbors<PointT>(cloud, reliable_neighbors);
     
     //compute raw scale and quaternions using cov
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -889,25 +884,10 @@ bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   for (int i = 0; i < cloud->size(); i++) {
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
-    int num_reliable_neighbors = 0;
     kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-
-    // Get number of reliable neighbors
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        ++num_reliable_neighbors;
-      }
-    }
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, num_reliable_neighbors);
-    for (int j = 0; j < k_indices.size(); j++) {
-      if (k_sq_distances[j] < knn_max_distance_){
-        neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
-      }
-    }
-
-    neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    const auto reliable_neighbors =
+      detail_fast_gicp::select_reliable_neighbor_indices(k_indices, k_sq_distances, knn_max_distance_);
+    Eigen::Matrix4d cov = detail_fast_gicp::covariance_from_neighbors<PointT>(cloud, reliable_neighbors);
     
     //compute raw scale and quaternions using cov
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);

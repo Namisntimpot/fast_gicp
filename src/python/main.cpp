@@ -137,6 +137,8 @@ std::string sparse_anchor_balance_mode_name(fast_gicp::SparseAnchorBalanceMode m
       return "BY_COUNT";
     case fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE:
       return "BY_HESSIAN_TRACE";
+    case fast_gicp::SparseAnchorBalanceMode::AUTO:
+      return "AUTO";
   }
 
   return "NONE";
@@ -154,6 +156,9 @@ fast_gicp::SparseAnchorBalanceMode sparse_anchor_balance_mode(const py::handle& 
     if (mode == "BY_HESSIAN_TRACE") {
       return fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE;
     }
+    if (mode == "AUTO") {
+      return fast_gicp::SparseAnchorBalanceMode::AUTO;
+    }
     throw std::invalid_argument("unknown sparse anchor balance mode: " + mode);
   }
 
@@ -165,6 +170,8 @@ fast_gicp::SparseAnchorBalanceMode sparse_anchor_balance_mode(const py::handle& 
       return fast_gicp::SparseAnchorBalanceMode::BY_COUNT;
     case 2:
       return fast_gicp::SparseAnchorBalanceMode::BY_HESSIAN_TRACE;
+    case 3:
+      return fast_gicp::SparseAnchorBalanceMode::AUTO;
     default:
       throw std::invalid_argument("unknown sparse anchor balance mode index");
   }
@@ -212,6 +219,9 @@ py::dict sparse_anchor_config_to_dict(const fast_gicp::SparseAnchorConfig& confi
   info["balance_mode"] = sparse_anchor_balance_mode_name(config.balance_mode);
   info["auto_balance_min"] = config.auto_balance_min;
   info["auto_balance_max"] = config.auto_balance_max;
+  info["auto_count_power"] = config.auto_count_power;
+  info["auto_ambiguity_floor"] = config.auto_ambiguity_floor;
+  info["auto_ambiguity_gain"] = config.auto_ambiguity_gain;
   return info;
 }
 
@@ -230,6 +240,12 @@ void update_sparse_anchor_config_from_dict(
       config->auto_balance_min = py::cast<double>(value);
     } else if (key == "auto_balance_max") {
       config->auto_balance_max = py::cast<double>(value);
+    } else if (key == "auto_count_power") {
+      config->auto_count_power = py::cast<double>(value);
+    } else if (key == "auto_ambiguity_floor") {
+      config->auto_ambiguity_floor = py::cast<double>(value);
+    } else if (key == "auto_ambiguity_gain") {
+      config->auto_ambiguity_gain = py::cast<double>(value);
     } else {
       throw std::invalid_argument("unknown sparse anchor config key: " + key);
     }
@@ -473,7 +489,7 @@ PYBIND11_MODULE(pygicp, m) {
     py::arg("source"),
     py::arg("method") = "GICP",
     py::arg("downsample_resolution") = -1.0,
-    py::arg("k_correspondences") = 15,
+    py::arg("k_correspondences") = 25,
     py::arg("max_correspondence_distance") = std::numeric_limits<double>::max(),
     py::arg("voxel_resolution") = 1.0,
     py::arg("num_threads") = 0,

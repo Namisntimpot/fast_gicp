@@ -18,7 +18,7 @@ enum class NeighborSearchMethod { DIRECT27, DIRECT7, DIRECT1, /* supported on on
 
 enum class VoxelAccumulationMode { ADDITIVE, ADDITIVE_WEIGHTED, MULTIPLICATIVE };
 
-enum class SparseAnchorBalanceMode { NONE, BY_COUNT, BY_HESSIAN_TRACE };
+enum class SparseAnchorBalanceMode { NONE, BY_COUNT, BY_HESSIAN_TRACE, AUTO };
 
 struct ObservabilityConfig {
   bool enable_observability_check = false;
@@ -66,10 +66,13 @@ struct ColorMatchingConfig {
 };
 
 struct SparseAnchorConfig {
-  double objective_weight = 1.0;
-  SparseAnchorBalanceMode balance_mode = SparseAnchorBalanceMode::BY_HESSIAN_TRACE;
+  double objective_weight = 1.5;
+  SparseAnchorBalanceMode balance_mode = SparseAnchorBalanceMode::AUTO;
   double auto_balance_min = 1e-3;
-  double auto_balance_max = 1e3;
+  double auto_balance_max = 10.0;
+  double auto_count_power = 0.35;
+  double auto_ambiguity_floor = 0.15;
+  double auto_ambiguity_gain = 0.75;
 };
 
 struct AlignmentQualityConfig {
