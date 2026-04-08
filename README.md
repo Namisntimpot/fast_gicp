@@ -306,6 +306,18 @@ gicp.set_alignment_quality_config({
 gicp.align()
 report = gicp.get_alignment_quality_report()
 print(report["suggested_accept"], report["rejection_reasons"])
+if report["used_sparse_anchors"]:
+    print(
+        report["anchor_balance_mode"],
+        report["anchor_objective_weight"],
+        report["anchor_auto_balance_factor"],
+        report["anchor_effective_scale"],
+    )
+    print(
+        report["geometry_hessian_trace"],
+        report["anchor_hessian_trace"],
+        report["anchor_balance_fallback_used"],
+    )
 
 ```
 
@@ -462,6 +474,16 @@ When the binary soft suppression is too coarse (either does nothing or constrain
     - `auto_balance_min`
     - `auto_balance_max`
 
+- Sparse-anchor balance diagnostics are included in `get_alignment_quality_report()` whenever an align call has run.
+  - Useful fields:
+    - `anchor_balance_mode`: which balancing rule was used
+    - `anchor_objective_weight`: user-provided multiplier
+    - `anchor_auto_balance_factor`: automatically computed balance factor
+    - `anchor_effective_scale`: final anchor scale applied inside the objective, equal to `anchor_objective_weight * anchor_auto_balance_factor`
+    - `geometry_hessian_trace`: unlocked trace of the geometry Hessian used by `BY_HESSIAN_TRACE`
+    - `anchor_hessian_trace`: unlocked trace of the anchor Hessian used by `BY_HESSIAN_TRACE`
+    - `anchor_balance_fallback_used`: `True` when auto balancing had to fall back to a neutral factor because the statistics were not usable
+
 ### Dense RGB correspondence
 
 - `set_source_colors(colors)` / `setSourceColors(...)`
@@ -500,8 +522,12 @@ When the binary soft suppression is too coarse (either does nothing or constrain
     - match support: `correspondence_count`, `matched_count`, `matched_ratio`
     - residual distribution: `mean_sq_distance`, `median_sq_distance`, `p90_sq_distance`, `p95_sq_distance`
     - observability: `rank`, `condition_number`, `ambiguity_scores`, `max_ambiguity`, `geometry_rank`, `geometry_condition_number`, `smooth_regularization_weights`
-    - anchor diagnostics: `anchor_count`, `anchor_mean_residual`, `anchor_p95_residual`, `anchor_balance_mode`, `anchor_auto_balance_factor`, `anchor_effective_scale`
+    - anchor diagnostics: `anchor_count`, `anchor_mean_residual`, `anchor_p95_residual`, `anchor_balance_mode`, `anchor_objective_weight`, `anchor_auto_balance_factor`, `anchor_effective_scale`, `geometry_hessian_trace`, `anchor_hessian_trace`, `anchor_balance_fallback_used`
     - advisory result: `suggested_accept`, `rejection_reasons`
+  - If sparse anchors are enabled, the balance-related fields let you inspect all three layers of scaling:
+    - `anchor_objective_weight`: manual top-level weight
+    - `anchor_auto_balance_factor`: auto-computed factor from the selected balance mode
+    - `anchor_effective_scale`: the actual multiplier applied to the sparse-anchor term
   - DOF order is always `[rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]`.
   - Recommended SLAM use:
     - do not trust `converged` alone
