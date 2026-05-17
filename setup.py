@@ -2,6 +2,7 @@
 import os
 import sys
 import glob
+import shutil
 import subprocess
 
 from setuptools import setup, Extension
@@ -46,6 +47,16 @@ class CMakeBuild(build_ext):
 
         # if some dependencies are installed in conda env...
         conda_prefix = os.environ.get("CONDA_PREFIX", None)
+        pybind11_cmake_dir = None
+        try:
+            import pybind11
+            pybind11_cmake_dir = pybind11.get_cmake_dir()
+        except Exception:
+            pybind11_cmake_dir = None
+
+        rpath_entries = ["$ORIGIN"]
+        if conda_prefix is not None:
+            rpath_entries.append(f"{conda_prefix}/lib")
 
         cmake_args = [
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}".format(extdir),
@@ -55,13 +66,17 @@ class CMakeBuild(build_ext):
             # "-DBUILD_VGICP_CUDA=ON",
             "-DBUILD_PYTHON_BINDINGS=ON",
             "-DBUILD_apps=OFF",
+            "-DCMAKE_BUILD_RPATH={}".format(";".join(rpath_entries)),
+            "-DCMAKE_INSTALL_RPATH={}".format(";".join(rpath_entries)),
+            "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
         ]
         if conda_prefix is not None:
             cmake_args += [
                 f"-DPCL_DIR={conda_prefix}/share/pcl-1.14",
                 f"-DBOOST_ROOT={conda_prefix}",
-                f"-Dpybind11_DIR={conda_prefix}/lib/python3.11/site-packages/pybind11/share/cmake/pybind11",
             ]
+        if pybind11_cmake_dir is not None:
+            cmake_args.append(f"-Dpybind11_DIR={pybind11_cmake_dir}")
         build_args = []
 
         if self.compiler.compiler_type != "msvc":
@@ -112,6 +127,8 @@ class CMakeBuild(build_ext):
         subprocess.check_call(
             ["cmake", "--build", "."] + build_args, cwd=self.build_temp
         )
+        for lib_path in glob.glob(os.path.join(extdir, "libfast_gicp*.so*")):
+            shutil.copy2(lib_path, ext.sourcedir)
 
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.

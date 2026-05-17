@@ -100,6 +100,18 @@ std::vector<double> numpy_to_double_list(const py::array& array) {
   return std::vector<double>(data, data + info.shape[0]);
 }
 
+std::vector<float> numpy_to_float_list(const py::array& array) {
+  py::array_t<float, py::array::c_style | py::array::forcecast> casted(array);
+  py::buffer_info info = casted.request();
+  ssize_t count = 1;
+  for (ssize_t dim = 0; dim < info.ndim; dim++) {
+    count *= info.shape[dim];
+  }
+
+  auto* data = static_cast<float*>(info.ptr);
+  return std::vector<float>(data, data + count);
+}
+
 std::string optimizer_name(fast_gicp::LSQ_OPTIMIZER_TYPE type) {
   switch (type) {
     case fast_gicp::LSQ_OPTIMIZER_TYPE::GaussNewton:
@@ -686,6 +698,22 @@ PYBIND11_MODULE(pygicp, m) {
     	const auto input_scales = scales.cast<std::vector<float>>();
     	gicp.setTargetCovariances(input_rotationsq, input_scales);
     })
+    .def("set_source_covariances_from_2dgs", [] (FastGICP& gicp, py::array rotationsq_xyzw, py::array scales_2d, const std::string& mode, double normal_sigma_ratio, double normal_sigma_min){
+      const auto input_rotationsq = numpy_to_float_list(rotationsq_xyzw);
+      const auto input_scales = numpy_to_float_list(scales_2d);
+      if(input_rotationsq.size() % 4 != 0 || input_scales.size() % 2 != 0 || input_rotationsq.size()/4 != input_scales.size()/2){
+        throw std::invalid_argument("[set_source_covariances_from_2dgs] expected rotations Nx4 and scales Nx2");
+      }
+      gicp.setSourceCovariances2DGS(input_rotationsq, input_scales, mode, normal_sigma_ratio, normal_sigma_min);
+    }, py::arg("rotationsq_xyzw"), py::arg("scales_2d"), py::arg("mode") = "physical", py::arg("normal_sigma_ratio") = 0.05, py::arg("normal_sigma_min") = 1e-4)
+    .def("set_target_covariances_from_2dgs", [] (FastGICP& gicp, py::array rotationsq_xyzw, py::array scales_2d, const std::string& mode, double normal_sigma_ratio, double normal_sigma_min){
+      const auto input_rotationsq = numpy_to_float_list(rotationsq_xyzw);
+      const auto input_scales = numpy_to_float_list(scales_2d);
+      if(input_rotationsq.size() % 4 != 0 || input_scales.size() % 2 != 0 || input_rotationsq.size()/4 != input_scales.size()/2){
+        throw std::invalid_argument("[set_target_covariances_from_2dgs] expected rotations Nx4 and scales Nx2");
+      }
+      gicp.setTargetCovariances2DGS(input_rotationsq, input_scales, mode, normal_sigma_ratio, normal_sigma_min);
+    }, py::arg("rotationsq_xyzw"), py::arg("scales_2d"), py::arg("mode") = "physical", py::arg("normal_sigma_ratio") = 0.05, py::arg("normal_sigma_min") = 1e-4)
     .def("set_source_z_values", [] (FastGICP& gicp, py::array z_values){
       const auto input_z_values = z_values.cast<std::vector<float>>();
     	gicp.setSourceZvalues(input_z_values);

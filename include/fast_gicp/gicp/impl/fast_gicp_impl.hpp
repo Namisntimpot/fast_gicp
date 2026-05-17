@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <limits>
 #include <numeric>
 
@@ -267,6 +268,17 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setSourceCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min)
+	{
+		setCovariances2DGS(input_rotationsq_xyzw, input_scales_2d, mode, normal_sigma_ratio, normal_sigma_min, source_covs_, source_rotationsq_, source_scales_);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setSourceZvalues(const std::vector<float>& input_z_values)
 	{
 		source_z_values_.clear();
@@ -307,6 +319,17 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 	const std::vector<float>& input_scales)
 	{
 		setCovariances(input_rotationsq, input_scales, target_covs_, target_rotationsq_, target_scales_);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setTargetCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min)
+	{
+		setCovariances2DGS(input_rotationsq_xyzw, input_scales_2d, mode, normal_sigma_ratio, normal_sigma_min, target_covs_, target_rotationsq_, target_scales_);
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -978,6 +1001,64 @@ bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   // std::cout << "Cloud size : " << newCloud->size() << "/cov size : " << covariances.size() << "/rots size : " << rotationsq.size()/4 << std::endl;
   // std::cout << "Checker : " << checker << std::endl;
   return true;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min,
+	std::vector<Eigen::Matrix4d,
+  Eigen::aligned_allocator<Eigen::Matrix4d>>& covariances,
+  std::vector<float>& rotationsq,
+  std::vector<float>& scales)
+	{
+	if(input_rotationsq_xyzw.size()/4 != input_scales_2d.size()/2){
+		throw std::invalid_argument("2DGS rotation/scale size mismatch");
+	}
+	if(mode != "physical" && mode != "normalized"){
+		throw std::invalid_argument("unknown 2DGS covariance mode: " + mode);
+	}
+	if(normal_sigma_ratio < 0.0 || normal_sigma_min < 0.0){
+		throw std::invalid_argument("2DGS normal sigma parameters must be non-negative");
+	}
+
+	const std::size_t n = input_scales_2d.size()/2;
+	rotationsq.clear();
+	scales.clear();
+	rotationsq = input_rotationsq_xyzw;
+	scales.resize(3*n);
+	covariances.resize(n);
+
+#pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
+	for(int i=0; i<static_cast<int>(n); i++){
+		const double s1 = std::max(static_cast<double>(input_scales_2d[2*i+0]), 1e-12);
+		const double s2 = std::max(static_cast<double>(input_scales_2d[2*i+1]), 1e-12);
+		const double sn = std::max(normal_sigma_ratio * std::min(s1, s2), normal_sigma_min);
+
+		scales[3*i+0] = static_cast<float>(s1);
+		scales[3*i+1] = static_cast<float>(s2);
+		scales[3*i+2] = static_cast<float>(sn);
+
+		const double x = static_cast<double>(input_rotationsq_xyzw[4*i+0]);
+		const double y = static_cast<double>(input_rotationsq_xyzw[4*i+1]);
+		const double z = static_cast<double>(input_rotationsq_xyzw[4*i+2]);
+		const double w = static_cast<double>(input_rotationsq_xyzw[4*i+3]);
+		Eigen::Quaterniond q(w, x, y, z);
+		q.normalize();
+
+		Eigen::Vector3d singular_values;
+		if(mode == "normalized"){
+			singular_values = Eigen::Vector3d(1.0, 1.0, 1e-3);
+		} else {
+			singular_values = Eigen::Vector3d(s1*s1, s2*s2, sn*sn);
+		}
+
+		covariances[i].setZero();
+		covariances[i].template block<3, 3>(0, 0) = q.toRotationMatrix() * singular_values.asDiagonal() * q.toRotationMatrix().transpose();
+	}
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>

@@ -73,6 +73,12 @@ public:
   virtual void setSourceCovariances(
 	const std::vector<float>& input_rotationsq,
 	const std::vector<float>& input_scales);
+  virtual void setSourceCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min);
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
   void calculateTargetCovariance();
   void calculateTargetCovarianceWithZ();
@@ -81,6 +87,12 @@ public:
   virtual void setTargetCovariances(
 	const std::vector<float>& input_rotationsq,
 	const std::vector<float>& input_scales);
+  virtual void setTargetCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min);
   
   virtual void setSourceZvalues(const std::vector<float>& input_z_values);
   virtual void setTargetZvalues(const std::vector<float>& input_z_values);
@@ -173,6 +185,16 @@ protected:
   void setCovariances(
 	const std::vector<float>& input_rotationsq,
 	const std::vector<float>& input_scales,
+	std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covariances,
+	std::vector<float>& rotationsq,
+	std::vector<float>& scales);
+
+  void setCovariances2DGS(
+	const std::vector<float>& input_rotationsq_xyzw,
+	const std::vector<float>& input_scales_2d,
+	const std::string& mode,
+	double normal_sigma_ratio,
+	double normal_sigma_min,
 	std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covariances,
 	std::vector<float>& rotationsq,
 	std::vector<float>& scales);

@@ -8,3 +8,5 @@ cmake-build/*
 *.egg-info
 README.html
 basic_tutoria.md
+
+*results
