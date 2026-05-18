@@ -24,12 +24,15 @@
 #include <cuda_runtime.h>
 
 #ifdef USE_CUVS
-// cuVS C-API for ANN/KNN search. We use the brute-force backend because the
-// per-frame target may differ; index-built methods (IVF, HNSW) would require
-// rebuilding per align which dominates KNN cost. Brute-force on GPU using
-// cuVS exploits cuBLAS + warp-cooperative top-k and is ~10-30x faster than our
-// hand-rolled brute force kernel on N>100K targets.
+// cuVS C-API for ANN/KNN search. Brute-force is used because: (a) target
+// changes every align(), index-built methods (IVF/HNSW) would rebuild every
+// frame which dominates KNN time; (b) cuVS brute-force exploits cuBLAS GEMM
+// for pairwise L2 + a warp-cooperative top-k, giving ~10-30x over our hand-
+// rolled kernel on N>100K.
+#include <cuvs/core/c_api.h>
+#include <cuvs/distance/distance.h>
 #include <cuvs/neighbors/brute_force.h>
+#include <cuvs/neighbors/common.h>
 #endif
 
 #include <algorithm>
@@ -57,6 +60,13 @@ constexpr int kMaxK = 32;  // upper bound on k_correspondences (in-register heap
 struct FastGICPCudaCoreState {
   thrust::device_vector<Eigen::Vector3f> source_points;
   thrust::device_vector<Eigen::Vector3f> target_points;
+#ifdef USE_CUVS
+  // cuVS resources (cuBLAS/raft handle) cached across launches.
+  // Creating cuvsResources is expensive (cuBLAS handle init etc.), so reuse
+  // across linearize() / covariance build calls.
+  cuvsResources_t cuvs_res = 0;
+  bool cuvs_res_init = false;
+#endif
 
   // Source/target per-point 3x3 covariance (already regularized).
   thrust::device_vector<Eigen::Matrix3f> source_covs;
@@ -566,7 +576,14 @@ __global__ void cost_kernel(
 FastGICPCudaCore::FastGICPCudaCore() : state_(new FastGICPCudaCoreState()) {
   cudaDeviceSynchronize();
 }
-FastGICPCudaCore::~FastGICPCudaCore() = default;
+FastGICPCudaCore::~FastGICPCudaCore() {
+#ifdef USE_CUVS
+  if (state_ && state_->cuvs_res_init) {
+    cuvsResourcesDestroy(state_->cuvs_res);
+    state_->cuvs_res_init = false;
+  }
+#endif
+}
 
 void FastGICPCudaCore::set_correspondence_randomness(int k) {
   if (k < 1 || k > kMaxK) {
@@ -772,10 +789,52 @@ void launch_knn_brute_force(
 }
 
 #ifdef USE_CUVS
-// cuVS brute-force KNN using the C API. Inputs are interleaved float3 in
-// device memory (Nx3). Outputs go to the same int/float buffers as the
-// hand-rolled path so downstream kernels are agnostic to the backend.
+namespace {
+// cuVS brute_force returns int64 neighbour indices (verified against the
+// cuvs python binding on 26.04). We allocate a side buffer and narrow to int
+// after the search.
+__global__ void cuvs_drop_self_kernel(const int64_t* __restrict__ in_idx_kp1,
+                                       const float* __restrict__ in_sq_kp1,
+                                       int n_q, int k,
+                                       int* __restrict__ out_idx,
+                                       float* __restrict__ out_sq) {
+  const int q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= n_q) return;
+  const int kp1 = k + 1;
+  int written = 0;
+  bool skipped = false;
+  for (int i = 0; i < kp1 && written < k; ++i) {
+    const int64_t nbr = in_idx_kp1[q * kp1 + i];
+    if (!skipped && static_cast<int>(nbr) == q) {
+      skipped = true;
+      continue;
+    }
+    out_idx[q * k + written] = static_cast<int>(nbr);
+    out_sq[q * k + written] = in_sq_kp1[q * kp1 + i];
+    ++written;
+  }
+  if (written < k) {
+    out_idx[q * k + written] = static_cast<int>(in_idx_kp1[q * kp1 + k]);
+    out_sq[q * k + written] = in_sq_kp1[q * kp1 + k];
+  }
+}
+
+__global__ void cuvs_copy_idx_kernel(const int64_t* __restrict__ in_idx,
+                                      int n, int* __restrict__ out_idx) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out_idx[i] = static_cast<int>(in_idx[i]);
+}
+}  // namespace
+
+// cuVS brute-force KNN. Returns squared L2 distances and indices for the
+// top-k nearest neighbours in `targets` for every point in `query`. When
+// `self_knn=true`, we ask cuVS for k+1 neighbours and drop the self-match
+// per row in a post-processing kernel.
+//
+// `res` is the cached resources handle owned by FastGICPCudaCoreState.
 void launch_knn_cuvs(
+  cuvsResources_t res,
   const thrust::device_vector<Eigen::Vector3f>& query,
   const thrust::device_vector<Eigen::Vector3f>& targets,
   int k,
@@ -788,86 +847,109 @@ void launch_knn_cuvs(
   out_sq->assign(n_q * k, 1e30f);
   if (n_q == 0 || n_t == 0) return;
 
-  cuvsResources_t res = nullptr;
-  cuvsError_t err = cuvsResourcesCreate(&res);
-  if (err != CUVS_SUCCESS) {
-    throw std::runtime_error("cuVS: cuvsResourcesCreate failed");
-  }
+  // Ask for k+1 when doing self-knn so we can drop the self hit.
+  const int k_req = self_knn ? (k + 1) : k;
 
-  // Build a brute-force index over the target set. Each Eigen::Vector3f is
-  // contiguous 3 floats; the device_vector storage is therefore Nx3 row-major.
-  DLManagedTensor index_data{};
-  index_data.dl_tensor.data = const_cast<Eigen::Vector3f*>(thrust::raw_pointer_cast(targets.data()));
-  int64_t idx_shape[2] = {static_cast<int64_t>(n_t), 3};
-  index_data.dl_tensor.shape = idx_shape;
-  index_data.dl_tensor.ndim = 2;
-  index_data.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
-  index_data.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  cuvsError_t err;
+
+  // Build the index over the targets. Eigen::Vector3f is 3 contiguous floats,
+  // so an Nx3 row-major view of targets.data() is valid.
+  DLManagedTensor dataset_tensor{};
+  dataset_tensor.dl_tensor.data = const_cast<Eigen::Vector3f*>(thrust::raw_pointer_cast(targets.data()));
+  int64_t d_shape[2] = {static_cast<int64_t>(n_t), 3};
+  dataset_tensor.dl_tensor.shape = d_shape;
+  dataset_tensor.dl_tensor.ndim = 2;
+  dataset_tensor.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+  dataset_tensor.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  dataset_tensor.dl_tensor.strides = nullptr;
+  dataset_tensor.dl_tensor.byte_offset = 0;
 
   cuvsBruteForceIndex_t index = nullptr;
   err = cuvsBruteForceIndexCreate(&index);
   if (err != CUVS_SUCCESS) {
-    cuvsResourcesDestroy(res);
-    throw std::runtime_error("cuVS: cuvsBruteForceIndexCreate failed");
+    throw std::runtime_error(std::string("cuVS: cuvsBruteForceIndexCreate failed: ") +
+                             (cuvsGetLastErrorText() ? cuvsGetLastErrorText() : ""));
   }
-  err = cuvsBruteForceBuild(res, &index_data, L2Expanded, 0.0f, index);
+  err = cuvsBruteForceBuild(res, &dataset_tensor, L2Expanded, 0.0f, index);
   if (err != CUVS_SUCCESS) {
     cuvsBruteForceIndexDestroy(index);
-    cuvsResourcesDestroy(res);
-    throw std::runtime_error("cuVS: cuvsBruteForceBuild failed");
+    throw std::runtime_error(std::string("cuVS: cuvsBruteForceBuild failed: ") +
+                             (cuvsGetLastErrorText() ? cuvsGetLastErrorText() : ""));
   }
 
-  // Search.
-  DLManagedTensor q_data{};
-  q_data.dl_tensor.data = const_cast<Eigen::Vector3f*>(thrust::raw_pointer_cast(query.data()));
+  // Search tensors.
+  DLManagedTensor q_tensor{};
+  q_tensor.dl_tensor.data = const_cast<Eigen::Vector3f*>(thrust::raw_pointer_cast(query.data()));
   int64_t q_shape[2] = {static_cast<int64_t>(n_q), 3};
-  q_data.dl_tensor.shape = q_shape;
-  q_data.dl_tensor.ndim = 2;
-  q_data.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
-  q_data.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  q_tensor.dl_tensor.shape = q_shape;
+  q_tensor.dl_tensor.ndim = 2;
+  q_tensor.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+  q_tensor.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  q_tensor.dl_tensor.strides = nullptr;
+  q_tensor.dl_tensor.byte_offset = 0;
 
-  // cuVS expects int64 indices. We allocate a side buffer and cast down to int.
-  thrust::device_vector<int64_t> idx_i64(n_q * k);
-  DLManagedTensor out_idx_t{};
-  out_idx_t.dl_tensor.data = thrust::raw_pointer_cast(idx_i64.data());
-  int64_t oi_shape[2] = {static_cast<int64_t>(n_q), static_cast<int64_t>(k)};
-  out_idx_t.dl_tensor.shape = oi_shape;
-  out_idx_t.dl_tensor.ndim = 2;
-  out_idx_t.dl_tensor.dtype = DLDataType{kDLInt, 64, 1};
-  out_idx_t.dl_tensor.device = DLDevice{kDLCUDA, 0};
-
-  DLManagedTensor out_dist_t{};
-  out_dist_t.dl_tensor.data = thrust::raw_pointer_cast(out_sq->data());
-  out_dist_t.dl_tensor.shape = oi_shape;
-  out_dist_t.dl_tensor.ndim = 2;
-  out_dist_t.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
-  out_dist_t.dl_tensor.device = DLDevice{kDLCUDA, 0};
-
-  cuvsFilter filter{};  // no prefilter
-  err = cuvsBruteForceSearch(res, /*params=*/nullptr, index,
-                             &q_data, &out_idx_t, &out_dist_t, filter);
-  cuvsBruteForceIndexDestroy(index);
-  cuvsResourcesDestroy(res);
-  if (err != CUVS_SUCCESS) {
-    throw std::runtime_error("cuVS: cuvsBruteForceSearch failed");
+  // cuVS brute_force returns int64 neighbour indices (per cuvs 26.04 python
+  // binding). Use an int64 scratch and narrow to int afterwards.
+  thrust::device_vector<int64_t> idx_i64(static_cast<std::size_t>(n_q) * k_req);
+  thrust::device_vector<float> dist_kp1;
+  thrust::device_vector<float>* dist_buf = out_sq;
+  if (self_knn) {
+    dist_kp1.resize(static_cast<std::size_t>(n_q) * k_req);
+    dist_buf = &dist_kp1;
   }
 
-  // Cast int64 -> int and (if self-knn) drop the matching index by shifting.
-  thrust::transform(idx_i64.begin(), idx_i64.end(), out_idx->begin(),
-                    [] __device__ (int64_t v) { return static_cast<int>(v); });
+  DLManagedTensor n_tensor{};
+  n_tensor.dl_tensor.data = thrust::raw_pointer_cast(idx_i64.data());
+  int64_t k_shape[2] = {static_cast<int64_t>(n_q), static_cast<int64_t>(k_req)};
+  n_tensor.dl_tensor.shape = k_shape;
+  n_tensor.dl_tensor.ndim = 2;
+  n_tensor.dl_tensor.dtype = DLDataType{kDLInt, 64, 1};
+  n_tensor.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  n_tensor.dl_tensor.strides = nullptr;
+  n_tensor.dl_tensor.byte_offset = 0;
 
-  // For self-KNN, cuVS returns the query point itself as the 1st neighbour.
-  // We have to drop those self-matches by post-processing each row: find any
-  // index == row and replace it with the LAST valid neighbour, shifting.
-  // For our use-case (covariance build from K nearest neighbours), this is
-  // simplest done by requesting k+1 instead of k and dropping the first hit
-  // afterwards. We don't do that here; downstream covariance kernel tolerates
-  // a self-match if k >= 2 (mean/cov over k points is still well-defined).
-  (void)self_knn;
+  DLManagedTensor d_tensor{};
+  d_tensor.dl_tensor.data = thrust::raw_pointer_cast(dist_buf->data());
+  d_tensor.dl_tensor.shape = k_shape;
+  d_tensor.dl_tensor.ndim = 2;
+  d_tensor.dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+  d_tensor.dl_tensor.device = DLDevice{kDLCUDA, 0};
+  d_tensor.dl_tensor.strides = nullptr;
+  d_tensor.dl_tensor.byte_offset = 0;
+
+  cuvsFilter prefilter;
+  prefilter.addr = 0;
+  prefilter.type = NO_FILTER;
+
+  err = cuvsBruteForceSearch(res, index, &q_tensor, &n_tensor, &d_tensor, prefilter);
+  cuvsBruteForceIndexDestroy(index);
+  if (err != CUVS_SUCCESS) {
+    throw std::runtime_error(std::string("cuVS: cuvsBruteForceSearch failed: ") +
+                             (cuvsGetLastErrorText() ? cuvsGetLastErrorText() : ""));
+  }
+
+  const int block = 128;
+  const int grid = (n_q + block - 1) / block;
+  if (self_knn) {
+    cuvs_drop_self_kernel<<<grid, block>>>(
+      thrust::raw_pointer_cast(idx_i64.data()),
+      thrust::raw_pointer_cast(dist_kp1.data()),
+      n_q, k,
+      thrust::raw_pointer_cast(out_idx->data()),
+      thrust::raw_pointer_cast(out_sq->data()));
+  } else {
+    cuvs_copy_idx_kernel<<<(n_q * k + block - 1) / block, block>>>(
+      thrust::raw_pointer_cast(idx_i64.data()),
+      n_q * k,
+      thrust::raw_pointer_cast(out_idx->data()));
+    // distances already written directly into *out_sq above.
+  }
+  FG_CUDA_CHECK(cudaGetLastError());
 }
 #endif
 
 void launch_knn(
+  FastGICPCudaCoreState* state,
   const thrust::device_vector<Eigen::Vector3f>& query,
   const thrust::device_vector<Eigen::Vector3f>& targets,
   int k,
@@ -877,11 +959,18 @@ void launch_knn(
   const std::string& backend) {
 #ifdef USE_CUVS
   if (backend == "cuvs") {
-    launch_knn_cuvs(query, targets, k, out_idx, out_sq, self_knn);
+    if (!state->cuvs_res_init) {
+      if (cuvsResourcesCreate(&state->cuvs_res) != CUVS_SUCCESS) {
+        throw std::runtime_error(std::string("cuVS: cuvsResourcesCreate failed: ") +
+                                 (cuvsGetLastErrorText() ? cuvsGetLastErrorText() : ""));
+      }
+      state->cuvs_res_init = true;
+    }
+    launch_knn_cuvs(state->cuvs_res, query, targets, k, out_idx, out_sq, self_knn);
     return;
   }
 #else
-  (void)backend;
+  (void)backend; (void)state;
 #endif
   launch_knn_brute_force(query, targets, k, out_idx, out_sq, self_knn);
 }
@@ -940,7 +1029,8 @@ void FastGICPCudaCore::ensure_source_covariances_() {
       state_->source_2dgs_mode, state_->source_2dgs_normal_ratio,
       state_->source_2dgs_normal_min, &state_->source_covs);
   } else {
-    launch_knn(state_->source_points, state_->source_points, k_correspondences_,
+    launch_knn(state_.get(),
+               state_->source_points, state_->source_points, k_correspondences_,
                &state_->source_knn_idx, &state_->sq_distances, /*self_knn=*/true,
                knn_backend_);
     launch_covariance(state_->source_points, state_->source_knn_idx, k_correspondences_,
@@ -961,7 +1051,8 @@ void FastGICPCudaCore::ensure_target_covariances_() {
       state_->target_2dgs_normal_min, &state_->target_covs);
   } else {
     thrust::device_vector<float> dummy_sq;
-    launch_knn(state_->target_points, state_->target_points, k_correspondences_,
+    launch_knn(state_.get(),
+               state_->target_points, state_->target_points, k_correspondences_,
                &state_->target_knn_idx, &dummy_sq, /*self_knn=*/true,
                knn_backend_);
     launch_covariance(state_->target_points, state_->target_knn_idx, k_correspondences_,

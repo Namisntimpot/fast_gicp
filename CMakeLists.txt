@@ -134,18 +134,24 @@ if(BUILD_VGICP_CUDA)
     find_path(CUVS_INCLUDE_DIR cuvs/neighbors/brute_force.h
       HINTS $ENV{CONDA_PREFIX}/include /usr/include /usr/local/include
       DOC "Directory containing cuvs/neighbors/brute_force.h")
+    # The C wrapper symbols live in libcuvs_c.so; libcuvs.so holds the C++
+    # implementation. Linking both keeps RPATH resolution simple.
+    find_library(CUVS_C_LIBRARY cuvs_c
+      HINTS $ENV{CONDA_PREFIX}/lib /usr/lib /usr/local/lib
+      DOC "libcuvs_c.so (C API wrapper)")
     find_library(CUVS_LIBRARY cuvs
       HINTS $ENV{CONDA_PREFIX}/lib /usr/lib /usr/local/lib
-      DOC "libcuvs.so")
-    if(NOT CUVS_INCLUDE_DIR OR NOT CUVS_LIBRARY)
+      DOC "libcuvs.so (C++ implementation)")
+    if(NOT CUVS_INCLUDE_DIR OR NOT CUVS_C_LIBRARY OR NOT CUVS_LIBRARY)
       message(FATAL_ERROR
         "USE_CUVS=ON but cuVS was not found. "
-        "Install with `mamba install -c rapidsai -c conda-forge cuvs-cu12` "
-        "or pass -DCUVS_INCLUDE_DIR=<path> -DCUVS_LIBRARY=<libcuvs.so>.")
+        "Install with `mamba install -c rapidsai -c conda-forge libcuvs cuvs cuda-version=12.8` "
+        "or pass -DCUVS_INCLUDE_DIR=<path> -DCUVS_C_LIBRARY=<libcuvs_c.so> "
+        "-DCUVS_LIBRARY=<libcuvs.so>.")
     endif()
-    message(STATUS "Found cuVS: ${CUVS_LIBRARY} (include ${CUVS_INCLUDE_DIR})")
+    message(STATUS "Found cuVS: ${CUVS_C_LIBRARY} (include ${CUVS_INCLUDE_DIR})")
     include_directories(${CUVS_INCLUDE_DIR})
-    list(APPEND FAST_GICP_CUVS_LIBS ${CUVS_LIBRARY})
+    list(APPEND FAST_GICP_CUVS_LIBS ${CUVS_C_LIBRARY} ${CUVS_LIBRARY})
     add_definitions(-DUSE_CUVS)
   endif()
 
