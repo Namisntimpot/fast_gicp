@@ -108,46 +108,112 @@ if(BUILD_PYTHON_BINDINGS)
 endif()
 
 ### CUDA ###
+option(USE_CUVS "Build the cuVS KNN backend for FastGICPCuda (requires cuVS)" OFF)
 if(BUILD_VGICP_CUDA)
-  set(CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
-  add_definitions(-DUSE_VGICP_CUDA)
+  # CUDA 12.x defaults to C++17 in nvcc; thrust 2.x requires C++17 to avoid
+  # thrust::pair ambiguity with libcudacxx. Force explicitly so old downstreams
+  # don't accidentally trigger C++14 paths in thrust headers.
+  set(CUDA_NVCC_FLAGS "--expt-relaxed-constexpr;-std=c++17;--expt-extended-lambda")
+  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-fPIC")
+  # Suppress noisy Eigen __host__/__device__ defaulted-function warnings.
+  list(APPEND CUDA_NVCC_FLAGS "-Xcudafe;--diag_suppress=20012")
+  # Target Blackwell + Ada + Ampere by default. CUDA 12.8 supports sm_120.
+  if(NOT DEFINED FAST_GICP_CUDA_ARCH)
+    set(FAST_GICP_CUDA_ARCH "120" CACHE STRING "CUDA arch (e.g. 75;86;89;120)")
+  endif()
+  foreach(arch ${FAST_GICP_CUDA_ARCH})
+    list(APPEND CUDA_NVCC_FLAGS "-gencode=arch=compute_${arch},code=sm_${arch}")
+  endforeach()
+  # New FastGICPCuda class is always built when BUILD_VGICP_CUDA=ON.
+  add_definitions(-DUSE_FAST_GICP_CUDA)
+  set(FAST_GICP_CUVS_LIBS "")
+  if(USE_CUVS)
+    # cuVS install layout: header `cuvs/neighbors/brute_force.h` + libcuvs.so.
+    # Recommended install via the rapidsai conda channel:
+    #   mamba install -c rapidsai -c conda-forge cuvs-cu12
+    find_path(CUVS_INCLUDE_DIR cuvs/neighbors/brute_force.h
+      HINTS $ENV{CONDA_PREFIX}/include /usr/include /usr/local/include
+      DOC "Directory containing cuvs/neighbors/brute_force.h")
+    find_library(CUVS_LIBRARY cuvs
+      HINTS $ENV{CONDA_PREFIX}/lib /usr/lib /usr/local/lib
+      DOC "libcuvs.so")
+    if(NOT CUVS_INCLUDE_DIR OR NOT CUVS_LIBRARY)
+      message(FATAL_ERROR
+        "USE_CUVS=ON but cuVS was not found. "
+        "Install with `mamba install -c rapidsai -c conda-forge cuvs-cu12` "
+        "or pass -DCUVS_INCLUDE_DIR=<path> -DCUVS_LIBRARY=<libcuvs.so>.")
+    endif()
+    message(STATUS "Found cuVS: ${CUVS_LIBRARY} (include ${CUVS_INCLUDE_DIR})")
+    include_directories(${CUVS_INCLUDE_DIR})
+    list(APPEND FAST_GICP_CUVS_LIBS ${CUVS_LIBRARY})
+    add_definitions(-DUSE_CUVS)
+  endif()
 
-  cuda_add_library(fast_vgicp_cuda SHARED
-    src/fast_gicp/cuda/fast_vgicp_cuda.cu
-    src/fast_gicp/cuda/brute_force_knn.cu
-    src/fast_gicp/cuda/covariance_estimation.cu
-    src/fast_gicp/cuda/covariance_estimation_rbf.cu
-    src/fast_gicp/cuda/covariance_regularization.cu
-    src/fast_gicp/cuda/gaussian_voxelmap.cu
-    src/fast_gicp/cuda/find_voxel_correspondences.cu
-    src/fast_gicp/cuda/compute_derivatives.cu
-    src/fast_gicp/cuda/compute_mahalanobis.cu
-    src/fast_gicp/cuda/ndt_cuda.cu
-    src/fast_gicp/cuda/ndt_compute_derivatives.cu
+  # ---- new FastGICPCuda library (clean, no nvbio) ----
+  # Built as a separate target so that pre-existing nvbio/VGICP issues under
+  # newer CUDA toolchains don't block the new classic-GICP CUDA path.
+  # B1: only the FastGICPCuda skeleton. Brute-force KNN will be added in B2
+  # with a nvbio-free implementation suitable for source < 100k & target up to
+  # several hundred K (heap-of-K maintained per source thread).
+  cuda_add_library(fast_gicp_cuda_kernels SHARED
+    src/fast_gicp/cuda/fast_gicp_cuda_core.cu
   )
-  target_include_directories(fast_vgicp_cuda PRIVATE
+  if(USE_CUVS)
+    target_link_libraries(fast_gicp_cuda_kernels ${FAST_GICP_CUVS_LIBS})
+  endif()
+  target_include_directories(fast_gicp_cuda_kernels PRIVATE
     include
     thirdparty/Eigen
-    thirdparty/nvbio
-    ${catkin_INCLUDE_DIRS}
+    ${PCL_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
   )
-  target_link_libraries(fast_vgicp_cuda
-    ${catkin_LIBRARIES}
-  )
-  cuda_add_cublas_to_target(fast_vgicp_cuda)
+  cuda_add_cublas_to_target(fast_gicp_cuda_kernels)
 
-  # add vgicp_cuda to libfast_gicp
   target_sources(fast_gicp PRIVATE
-    src/fast_gicp/gicp/fast_vgicp_cuda.cpp
-    src/fast_gicp/ndt/ndt_cuda.cpp
+    src/fast_gicp/gicp/fast_gicp_cuda.cpp
   )
   target_link_libraries(fast_gicp
-    fast_vgicp_cuda
+    fast_gicp_cuda_kernels
   )
-  add_dependencies(fast_gicp fast_vgicp_cuda)
-  if(catkin_FOUND)
-    install(TARGETS fast_vgicp_cuda
-      LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+  add_dependencies(fast_gicp fast_gicp_cuda_kernels)
+
+  # ---- legacy fast_vgicp_cuda (voxel VGICP + NDT) ----
+  # This library uses nvbio and may fail to build on newer CUDA toolchains.
+  # Gated by FAST_GICP_BUILD_LEGACY_VGICP_CUDA so users can opt-in.
+  option(FAST_GICP_BUILD_LEGACY_VGICP_CUDA "Build legacy nvbio-based VGICP/NDT CUDA library" OFF)
+  if(FAST_GICP_BUILD_LEGACY_VGICP_CUDA)
+    add_definitions(-DUSE_VGICP_CUDA)
+    cuda_add_library(fast_vgicp_cuda SHARED
+      src/fast_gicp/cuda/fast_vgicp_cuda.cu
+      src/fast_gicp/cuda/brute_force_knn.cu
+      src/fast_gicp/cuda/covariance_estimation.cu
+      src/fast_gicp/cuda/covariance_estimation_rbf.cu
+      src/fast_gicp/cuda/covariance_regularization.cu
+      src/fast_gicp/cuda/gaussian_voxelmap.cu
+      src/fast_gicp/cuda/find_voxel_correspondences.cu
+      src/fast_gicp/cuda/compute_derivatives.cu
+      src/fast_gicp/cuda/compute_mahalanobis.cu
+      src/fast_gicp/cuda/ndt_cuda.cu
+      src/fast_gicp/cuda/ndt_compute_derivatives.cu
+    )
+    target_include_directories(fast_vgicp_cuda PRIVATE
+      include
+      thirdparty/Eigen
+      thirdparty/nvbio
+      ${catkin_INCLUDE_DIRS}
+    )
+    target_link_libraries(fast_vgicp_cuda ${catkin_LIBRARIES})
+    cuda_add_cublas_to_target(fast_vgicp_cuda)
+    target_sources(fast_gicp PRIVATE
+      src/fast_gicp/gicp/fast_vgicp_cuda.cpp
+      src/fast_gicp/ndt/ndt_cuda.cpp
+    )
+    target_link_libraries(fast_gicp fast_vgicp_cuda)
+    add_dependencies(fast_gicp fast_vgicp_cuda)
+    if(catkin_FOUND)
+      install(TARGETS fast_vgicp_cuda
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+    endif()
   endif()
 endif()
 

@@ -12,6 +12,9 @@
 #include <fast_gicp/ndt/ndt_cuda.hpp>
 #include <fast_gicp/gicp/fast_vgicp_cuda.hpp>
 #endif
+#ifdef USE_FAST_GICP_CUDA
+#include <fast_gicp/gicp/fast_gicp_cuda.hpp>
+#endif
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -548,6 +551,9 @@ using FastVGICP = fast_gicp::FastVGICP<pcl::PointXYZ, pcl::PointXYZ>;
 using FastVGICPCuda = fast_gicp::FastVGICPCuda<pcl::PointXYZ, pcl::PointXYZ>;
 using NDTCuda = fast_gicp::NDTCuda<pcl::PointXYZ, pcl::PointXYZ>;
 #endif
+#ifdef USE_FAST_GICP_CUDA
+using FastGICPCuda = fast_gicp::FastGICPCuda<pcl::PointXYZ, pcl::PointXYZ>;
+#endif
 
 PYBIND11_MODULE(pygicp, m) {
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
@@ -877,6 +883,34 @@ PYBIND11_MODULE(pygicp, m) {
       , py::arg("method") = "DIRECT1", py::arg("radius") = 1.5
     )
     .def("set_resolution", &NDTCuda::setResolution)
+  ;
+#endif
+
+#ifdef USE_FAST_GICP_CUDA
+  py::class_<FastGICPCuda, LsqRegistration, std::shared_ptr<FastGICPCuda>>(m, "FastGICPCuda")
+    .def(py::init())
+    .def("set_correspondence_randomness", &FastGICPCuda::setCorrespondenceRandomness)
+    .def("set_max_correspondence_distance", &FastGICPCuda::setMaxCorrespondenceDistance)
+    .def("set_knn_backend", &FastGICPCuda::setKnnBackend)
+    .def("get_knn_backend", &FastGICPCuda::getKnnBackend)
+    .def("get_source_size", &FastGICPCuda::getSourceSize)
+    .def("get_target_size", &FastGICPCuda::getTargetSize)
+    .def("set_source_covariances_from_2dgs", [] (FastGICPCuda& g, py::array rotationsq_xyzw, py::array scales_2d, const std::string& mode, double normal_sigma_ratio, double normal_sigma_min) {
+      const auto rot = numpy_to_float_list(rotationsq_xyzw);
+      const auto scl = numpy_to_float_list(scales_2d);
+      if (rot.size() % 4 != 0 || scl.size() % 2 != 0 || rot.size()/4 != scl.size()/2) {
+        throw std::invalid_argument("[FastGICPCuda.set_source_covariances_from_2dgs] expected rotations Nx4 and scales Nx2");
+      }
+      g.setSourceCovariances2DGS(rot, scl, mode, normal_sigma_ratio, normal_sigma_min);
+    }, py::arg("rotationsq_xyzw"), py::arg("scales_2d"), py::arg("mode") = "physical", py::arg("normal_sigma_ratio") = 0.05, py::arg("normal_sigma_min") = 1e-4)
+    .def("set_target_covariances_from_2dgs", [] (FastGICPCuda& g, py::array rotationsq_xyzw, py::array scales_2d, const std::string& mode, double normal_sigma_ratio, double normal_sigma_min) {
+      const auto rot = numpy_to_float_list(rotationsq_xyzw);
+      const auto scl = numpy_to_float_list(scales_2d);
+      if (rot.size() % 4 != 0 || scl.size() % 2 != 0 || rot.size()/4 != scl.size()/2) {
+        throw std::invalid_argument("[FastGICPCuda.set_target_covariances_from_2dgs] expected rotations Nx4 and scales Nx2");
+      }
+      g.setTargetCovariances2DGS(rot, scl, mode, normal_sigma_ratio, normal_sigma_min);
+    }, py::arg("rotationsq_xyzw"), py::arg("scales_2d"), py::arg("mode") = "physical", py::arg("normal_sigma_ratio") = 0.05, py::arg("normal_sigma_min") = 1e-4)
   ;
 #endif
 
