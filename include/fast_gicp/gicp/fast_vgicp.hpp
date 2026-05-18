@@ -68,6 +68,11 @@ public:
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
 
 protected:
+  // FastVGICP does not implement dynamic outlier rejection. Override back to
+  // false (FastGICP overrides to true) so enabling rejection on FastVGICP
+  // throws at config-time.
+  virtual bool supports_dynamic_rejection() const override { return false; }
+
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
   virtual void update_correspondences(const Eigen::Isometry3d& trans) override;
   virtual int current_geometric_term_count() const override;

@@ -248,6 +248,79 @@ void update_sparse_anchor_config_from_dict(
   }
 }
 
+std::string dynamic_rejection_kernel_name(fast_gicp::DynamicRejectionKernel kernel) {
+  switch (kernel) {
+    case fast_gicp::DynamicRejectionKernel::NONE: return "NONE";
+    case fast_gicp::DynamicRejectionKernel::GEMAN_MCCLURE: return "GEMAN_MCCLURE";
+    case fast_gicp::DynamicRejectionKernel::CAUCHY: return "CAUCHY";
+  }
+  return "GEMAN_MCCLURE";
+}
+
+fast_gicp::DynamicRejectionKernel dynamic_rejection_kernel_from(const py::handle& value) {
+  if (py::isinstance<py::str>(value)) {
+    const std::string s = py::cast<std::string>(value);
+    if (s == "NONE") return fast_gicp::DynamicRejectionKernel::NONE;
+    if (s == "GEMAN_MCCLURE") return fast_gicp::DynamicRejectionKernel::GEMAN_MCCLURE;
+    if (s == "CAUCHY") return fast_gicp::DynamicRejectionKernel::CAUCHY;
+    throw std::invalid_argument("unknown dynamic rejection kernel: " + s);
+  }
+  throw std::invalid_argument("dynamic rejection kernel must be a string");
+}
+
+py::dict dynamic_rejection_config_to_dict(const fast_gicp::DynamicRejectionConfig& cfg) {
+  py::dict d;
+  d["enable"] = cfg.enable;
+  d["kernel"] = dynamic_rejection_kernel_name(cfg.kernel);
+  d["warmup_iterations"] = cfg.warmup_iterations;
+  d["mad_scale"] = cfg.mad_scale;
+  d["gnc_mu_init_scale"] = cfg.gnc_mu_init_scale;
+  d["gnc_mu_floor_scale"] = cfg.gnc_mu_floor_scale;
+  d["gnc_mu_decay"] = cfg.gnc_mu_decay;
+  d["gnc_steps_per_mu"] = cfg.gnc_steps_per_mu;
+  d["min_inlier_ratio"] = cfg.min_inlier_ratio;
+  d["anchor_rejection_enabled"] = cfg.anchor_rejection_enabled;
+  d["basin_verify_enabled"] = cfg.basin_verify_enabled;
+  d["basin_suspect_cost_ratio"] = cfg.basin_suspect_cost_ratio;
+  return d;
+}
+
+void update_dynamic_rejection_config_from_dict(fast_gicp::DynamicRejectionConfig* cfg, const py::dict& options) {
+  for (auto item : options) {
+    const std::string key = py::cast<std::string>(item.first);
+    const py::handle value = item.second;
+    if (key == "enable") cfg->enable = py::cast<bool>(value);
+    else if (key == "kernel") cfg->kernel = dynamic_rejection_kernel_from(value);
+    else if (key == "warmup_iterations") cfg->warmup_iterations = py::cast<int>(value);
+    else if (key == "mad_scale") cfg->mad_scale = py::cast<double>(value);
+    else if (key == "gnc_mu_init_scale") cfg->gnc_mu_init_scale = py::cast<double>(value);
+    else if (key == "gnc_mu_floor_scale") cfg->gnc_mu_floor_scale = py::cast<double>(value);
+    else if (key == "gnc_mu_decay") cfg->gnc_mu_decay = py::cast<double>(value);
+    else if (key == "gnc_steps_per_mu") cfg->gnc_steps_per_mu = py::cast<int>(value);
+    else if (key == "min_inlier_ratio") cfg->min_inlier_ratio = py::cast<double>(value);
+    else if (key == "anchor_rejection_enabled") cfg->anchor_rejection_enabled = py::cast<bool>(value);
+    else if (key == "basin_verify_enabled") cfg->basin_verify_enabled = py::cast<bool>(value);
+    else if (key == "basin_suspect_cost_ratio") cfg->basin_suspect_cost_ratio = py::cast<double>(value);
+    else throw std::invalid_argument("unknown dynamic rejection config key: " + key);
+  }
+}
+
+py::dict dynamic_rejection_diagnostics_to_dict(const fast_gicp::DynamicRejectionDiagnostics& diag) {
+  py::dict d;
+  d["enabled"] = diag.enabled;
+  d["active"] = diag.active;
+  d["gnc_iterations"] = diag.gnc_iterations;
+  d["final_mu"] = diag.final_mu;
+  d["inlier_sigma"] = diag.inlier_sigma;
+  d["total_correspondences"] = diag.total_correspondences;
+  d["inlier_count"] = diag.inlier_count;
+  d["anchor_total"] = diag.anchor_total;
+  d["anchor_inlier_count"] = diag.anchor_inlier_count;
+  d["mean_inlier_residual"] = diag.mean_inlier_residual;
+  d["mean_outlier_residual"] = diag.mean_outlier_residual;
+  return d;
+}
+
 void update_alignment_quality_config_from_dict(
   fast_gicp::AlignmentQualityConfig* config,
   const py::dict& options) {
@@ -611,6 +684,44 @@ PYBIND11_MODULE(pygicp, m) {
     .def("get_alignment_quality_report", [] (LsqRegistration& reg) {
       return alignment_quality_report_to_dict(reg.getAlignmentQualityReport());
     })
+    // ---------- Dynamic rejection bindings -------------------------------------
+    .def("set_dynamic_rejection_config", [] (LsqRegistration& reg, const py::dict& options) {
+      auto cfg = reg.getDynamicRejectionConfig();
+      update_dynamic_rejection_config_from_dict(&cfg, options);
+      reg.setDynamicRejectionConfig(cfg);
+    })
+    .def("set_dynamic_rejection_enabled", &LsqRegistration::setDynamicRejectionEnabled)
+    .def("get_dynamic_rejection_config", [] (LsqRegistration& reg) {
+      return dynamic_rejection_config_to_dict(reg.getDynamicRejectionConfig());
+    })
+    .def("get_dynamic_rejection_diagnostics", [] (LsqRegistration& reg) {
+      return dynamic_rejection_diagnostics_to_dict(reg.getDynamicRejectionDiagnostics());
+    })
+    .def("get_dynamic_correspondence_weights", [] (LsqRegistration& reg) {
+      const auto& w = reg.getDynamicCorrespondenceWeights();
+      return py::array_t<double>(w.size(), w.data());
+    })
+    .def("get_dynamic_correspondence_residuals", [] (LsqRegistration& reg) {
+      const auto& r = reg.getDynamicCorrespondenceResiduals();
+      return py::array_t<double>(r.size(), r.data());
+    })
+    .def("get_dynamic_anchor_weights", [] (LsqRegistration& reg) {
+      const auto& w = reg.getDynamicAnchorWeights();
+      return py::array_t<double>(w.size(), w.data());
+    })
+    .def("get_dynamic_anchor_residuals", [] (LsqRegistration& reg) {
+      const auto& r = reg.getDynamicAnchorResiduals();
+      return py::array_t<double>(r.size(), r.data());
+    })
+    .def("set_multi_restart_initial_guesses", [] (LsqRegistration& reg, const py::list& guesses) {
+      std::vector<Eigen::Matrix4f> mats;
+      mats.reserve(py::len(guesses));
+      for (auto item : guesses) {
+        mats.push_back(item.cast<Eigen::Matrix4f>());
+      }
+      reg.setMultiRestartInitialGuesses(mats);
+    })
+    .def("clear_multi_restart_initial_guesses", &LsqRegistration::clearMultiRestartInitialGuesses)
     .def("get_fitness_score", [] (LsqRegistration& reg, const double max_range) { return reg.getFitnessScore(max_range); })
     .def("align",
       [] (LsqRegistration& reg, const Eigen::Matrix4f& initial_guess) { 

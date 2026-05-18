@@ -58,6 +58,7 @@ add_library(fast_gicp SHARED
   src/fast_gicp/gicp/fast_gicp.cpp
   src/fast_gicp/gicp/fast_gicp_st.cpp
   src/fast_gicp/gicp/fast_vgicp.cpp
+  src/fast_gicp/gicp/dynamic_rejection.cpp
 )
 target_link_libraries(fast_gicp
   ${PCL_LIBRARIES}
@@ -155,6 +156,10 @@ if(BUILD_test)
   add_executable(gicp_selfcheck src/test/gicp_selfcheck.cpp)
   add_dependencies(gicp_selfcheck fast_gicp)
   target_link_libraries(gicp_selfcheck ${PCL_LIBRARIES} fast_gicp)
+
+  add_executable(dynamic_rejection_test src/test/dynamic_rejection_test.cpp)
+  add_dependencies(dynamic_rejection_test fast_gicp)
+  target_link_libraries(dynamic_rejection_test fast_gicp)
 endif()
 
 if(BUILD_benchmarks)

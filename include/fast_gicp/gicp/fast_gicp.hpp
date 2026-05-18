@@ -131,6 +131,7 @@ public:
 
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
+  virtual bool supports_dynamic_rejection() const override { return true; }
 
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
   bool color_matching_ready() const;

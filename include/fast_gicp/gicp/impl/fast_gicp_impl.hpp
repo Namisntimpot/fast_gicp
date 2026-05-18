@@ -426,6 +426,11 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
   typename LsqRegistration<PointSource, PointTarget>::Vector6* b) {
   update_correspondences(trans);
 
+  // Resize residual buffer in the base class (sentinel -1 == no correspondence)
+  this->dyn_correspondence_residuals_.assign(input_->size(), -1.0);
+  const bool use_dyn_weights = !this->dyn_correspondence_weights_.empty() &&
+                               this->dyn_correspondence_weights_.size() == input_->size();
+
   double sum_errors = 0.0;
   std::vector<Eigen::Matrix<double, 6, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 6>>> Hs(num_threads_);
   std::vector<Eigen::Matrix<double, 6, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 1>>> bs(num_threads_);
@@ -450,9 +455,14 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
     const Eigen::Vector4d error = mean_B - transed_mean_A;
 
-    sum_errors += error.transpose() * mahalanobis_[i] * error;
+    const double r2 = error.transpose() * mahalanobis_[i] * error;
+    this->dyn_correspondence_residuals_[i] = r2;
 
-    if (H == nullptr || b == nullptr) {
+    const double w = use_dyn_weights ? std::max(0.0, std::min(1.0, this->dyn_correspondence_weights_[i])) : 1.0;
+
+    sum_errors += w * r2;
+
+    if (H == nullptr || b == nullptr || w == 0.0) {
       continue;
     }
 
@@ -462,8 +472,8 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
 
     Eigen::Matrix<double, 4, 6> jlossexp = dtdx0;
 
-    Eigen::Matrix<double, 6, 6> Hi = jlossexp.transpose() * mahalanobis_[i] * jlossexp;
-    Eigen::Matrix<double, 6, 1> bi = jlossexp.transpose() * mahalanobis_[i] * error;
+    Eigen::Matrix<double, 6, 6> Hi = w * (jlossexp.transpose() * mahalanobis_[i] * jlossexp);
+    Eigen::Matrix<double, 6, 1> bi = w * (jlossexp.transpose() * mahalanobis_[i] * error);
 
     Hs[omp_get_thread_num()] += Hi;
     bs[omp_get_thread_num()] += bi;
@@ -484,6 +494,8 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::compute_error(const Eigen::Isometry3d& trans) {
   double sum_errors = 0.0;
+  const bool use_dyn_weights = !this->dyn_correspondence_weights_.empty() &&
+                               this->dyn_correspondence_weights_.size() == input_->size();
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
@@ -501,7 +513,9 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
     const Eigen::Vector4d error = mean_B - transed_mean_A;
 
-    sum_errors += error.transpose() * mahalanobis_[i] * error;
+    const double w = use_dyn_weights ? std::max(0.0, std::min(1.0, this->dyn_correspondence_weights_[i])) : 1.0;
+    const double r2 = error.transpose() * mahalanobis_[i] * error;
+    sum_errors += w * r2;
   }
 
   return sum_errors;

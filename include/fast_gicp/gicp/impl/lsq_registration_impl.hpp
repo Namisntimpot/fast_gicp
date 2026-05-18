@@ -117,6 +117,9 @@ LsqRegistration<PointTarget, PointSource>::LsqRegistration() {
   final_hessian_.setIdentity();
   final_regularized_hessian_.setIdentity();
   use_sparse_anchors_ = false;
+
+  gnc_mu_current_ = 0.0;
+  gnc_mu_floor_ = 0.0;
 }
 
 template <typename PointTarget, typename PointSource>
@@ -301,6 +304,142 @@ void LsqRegistration<PointTarget, PointSource>::clearSparseAnchorCorrespondences
   use_sparse_anchors_ = false;
 }
 
+// ===== Dynamic rejection API =====
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setDynamicRejectionConfig(const DynamicRejectionConfig& config) {
+  if (config.enable && !supports_dynamic_rejection()) {
+    throw std::runtime_error("DynamicRejection is only supported on FastGICP (classic / 2DGS surfel) and sparse anchors. Using FastVGICP / VGICP_CUDA / NDT_CUDA with dynamic rejection enabled is unsupported.");
+  }
+  if (config.warmup_iterations < 0) {
+    throw std::invalid_argument("DynamicRejectionConfig.warmup_iterations must be >= 0");
+  }
+  if (config.mad_scale <= 0.0) {
+    throw std::invalid_argument("DynamicRejectionConfig.mad_scale must be > 0");
+  }
+  if (config.gnc_mu_init_scale <= 0.0 || config.gnc_mu_floor_scale <= 0.0) {
+    throw std::invalid_argument("DynamicRejectionConfig.gnc_mu_*_scale must be > 0");
+  }
+  if (config.gnc_mu_decay <= 0.0 || config.gnc_mu_decay > 1.0) {
+    throw std::invalid_argument("DynamicRejectionConfig.gnc_mu_decay must be in (0, 1]");
+  }
+  if (config.gnc_steps_per_mu < 1) {
+    throw std::invalid_argument("DynamicRejectionConfig.gnc_steps_per_mu must be >= 1");
+  }
+  if (config.min_inlier_ratio < 0.0 || config.min_inlier_ratio > 1.0) {
+    throw std::invalid_argument("DynamicRejectionConfig.min_inlier_ratio must be in [0, 1]");
+  }
+  dynamic_rejection_config_ = config;
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setDynamicRejectionEnabled(bool enable) {
+  DynamicRejectionConfig cfg = dynamic_rejection_config_;
+  cfg.enable = enable;
+  setDynamicRejectionConfig(cfg);
+}
+
+template <typename PointTarget, typename PointSource>
+const DynamicRejectionConfig& LsqRegistration<PointTarget, PointSource>::getDynamicRejectionConfig() const {
+  return dynamic_rejection_config_;
+}
+
+template <typename PointTarget, typename PointSource>
+const DynamicRejectionDiagnostics& LsqRegistration<PointTarget, PointSource>::getDynamicRejectionDiagnostics() const {
+  return dynamic_rejection_diagnostics_;
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::setMultiRestartInitialGuesses(const std::vector<Eigen::Matrix4f>& guesses) {
+  multi_restart_guesses_ = guesses;
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::clearMultiRestartInitialGuesses() {
+  multi_restart_guesses_.clear();
+}
+
+template <typename PointTarget, typename PointSource>
+void LsqRegistration<PointTarget, PointSource>::prepare_dynamic_weights_for_iteration(int iter) {
+  if (!dynamic_rejection_config_.enable ||
+      dynamic_rejection_config_.kernel == DynamicRejectionKernel::NONE) {
+    dyn_correspondence_weights_.clear();
+    dyn_anchor_weights_.clear();
+    return;
+  }
+
+  // During warmup, force weights to 1.0 (size matched to residuals if available).
+  if (iter < dynamic_rejection_config_.warmup_iterations) {
+    dyn_correspondence_weights_.assign(dyn_correspondence_residuals_.size(), 1.0);
+    dyn_anchor_weights_.assign(dyn_anchor_residuals_.size(), 1.0);
+    dynamic_rejection_diagnostics_.active = false;
+    return;
+  }
+
+  // Filter residuals: invalid entries (-1.0) should not influence MAD.
+  std::vector<double> valid_geom;
+  valid_geom.reserve(dyn_correspondence_residuals_.size());
+  for (double r : dyn_correspondence_residuals_) {
+    if (std::isfinite(r) && r >= 0.0) valid_geom.push_back(r);
+  }
+
+  // Initialise mu at the first post-warmup iteration.
+  if (iter == dynamic_rejection_config_.warmup_iterations) {
+    gnc_mu_current_ = dyn::initial_mu_from_residuals(valid_geom, dynamic_rejection_config_);
+    gnc_mu_floor_ = dyn::floor_mu_from_residuals(valid_geom, dynamic_rejection_config_);
+    dynamic_rejection_diagnostics_.gnc_iterations = 0;
+    dynamic_rejection_diagnostics_.inlier_sigma = std::sqrt(std::max(gnc_mu_floor_, 0.0));
+  } else {
+    // Periodic mu shrink — every gnc_steps_per_mu iterations after warmup.
+    const int steps_since_init = iter - dynamic_rejection_config_.warmup_iterations;
+    if (steps_since_init > 0 && (steps_since_init % std::max(1, dynamic_rejection_config_.gnc_steps_per_mu)) == 0) {
+      gnc_mu_current_ = dyn::next_mu(gnc_mu_current_, gnc_mu_floor_, dynamic_rejection_config_.gnc_mu_decay);
+      dynamic_rejection_diagnostics_.gnc_iterations++;
+    }
+  }
+
+  // Compute geometry weights with min-inlier-ratio floor.
+  dyn::compute_weights_with_floor(
+    dynamic_rejection_config_.kernel,
+    gnc_mu_current_,
+    dyn_correspondence_residuals_,
+    dynamic_rejection_config_.min_inlier_ratio,
+    &dyn_correspondence_weights_);
+
+  // Set invalid residuals' weight to 0 (so they remain skipped).
+  for (std::size_t i = 0; i < dyn_correspondence_residuals_.size() && i < dyn_correspondence_weights_.size(); ++i) {
+    if (!(std::isfinite(dyn_correspondence_residuals_[i]) && dyn_correspondence_residuals_[i] >= 0.0)) {
+      dyn_correspondence_weights_[i] = 0.0;
+    }
+  }
+
+  // Anchor weights — share the same mu schedule.
+  if (dynamic_rejection_config_.anchor_rejection_enabled && !dyn_anchor_residuals_.empty()) {
+    dyn::compute_weights_with_floor(
+      dynamic_rejection_config_.kernel,
+      gnc_mu_current_,
+      dyn_anchor_residuals_,
+      0.0,
+      &dyn_anchor_weights_);
+  } else {
+    dyn_anchor_weights_.assign(dyn_anchor_residuals_.size(), 1.0);
+  }
+
+  // Update diagnostics summary.
+  dynamic_rejection_diagnostics_.enabled = true;
+  dynamic_rejection_diagnostics_.active = true;
+  dynamic_rejection_diagnostics_.final_mu = gnc_mu_current_;
+  const auto geom_stats = dyn::summarise_weights(dyn_correspondence_residuals_, dyn_correspondence_weights_);
+  dynamic_rejection_diagnostics_.total_correspondences = geom_stats.total;
+  dynamic_rejection_diagnostics_.inlier_count = geom_stats.inliers;
+  dynamic_rejection_diagnostics_.mean_inlier_residual = geom_stats.mean_inlier_residual;
+  dynamic_rejection_diagnostics_.mean_outlier_residual = geom_stats.mean_outlier_residual;
+  const auto anchor_stats = dyn::summarise_weights(dyn_anchor_residuals_, dyn_anchor_weights_);
+  dynamic_rejection_diagnostics_.anchor_total = anchor_stats.total;
+  dynamic_rejection_diagnostics_.anchor_inlier_count = anchor_stats.inliers;
+}
+
+
 template <typename PointTarget, typename PointSource>
 double LsqRegistration<PointTarget, PointSource>::evaluateCost(const Eigen::Matrix4f& relative_pose, Matrix6* H, Vector6* b) {
   PreparedLinearSystem system = build_linearized_system(Eigen::Isometry3f(relative_pose).cast<double>());
@@ -320,38 +459,106 @@ int LsqRegistration<PointTarget, PointSource>::current_geometric_term_count() co
 
 template <typename PointTarget, typename PointSource>
 void LsqRegistration<PointTarget, PointSource>::computeTransformation(PointCloudSource& output, const Matrix4& guess) {
-  Eigen::Isometry3d x0 = Eigen::Isometry3d(guess.template cast<double>());
-
-  lm_lambda_ = -1.0;
-  converged_ = false;
-  nr_iterations_ = 0;
-  alignment_quality_report_ = AlignmentQualityReport();
-
-  if (lm_debug_print_) {
-    std::cout << "********************************************" << std::endl;
-    std::cout << "***************** optimize *****************" << std::endl;
-    std::cout << "********************************************" << std::endl;
+  // Multi-restart wrapper: if user provided multiple initial guesses, run from
+  // each and pick the one with lowest final cost. The `guess` argument is used
+  // as a fallback when no multi-restart guesses are configured.
+  std::vector<Matrix4> guesses;
+  if (multi_restart_guesses_.empty()) {
+    guesses.push_back(guess);
+  } else {
+    guesses.reserve(multi_restart_guesses_.size());
+    for (const auto& g : multi_restart_guesses_) {
+      guesses.push_back(g);
+    }
   }
 
-  int iterations_performed = 0;
-  for (int i = 0; i < max_iterations_ && !converged_; i++) {
-    iterations_performed = i + 1;
-    Eigen::Isometry3d delta;
-    if (!step_optimize(x0, delta)) {
-      std::cerr << "lm not converged!!" << std::endl;
-      break;
+  double best_cost = std::numeric_limits<double>::infinity();
+  Matrix4 best_transform = guess;
+  AlignmentQualityReport best_report;
+  Matrix6 best_hessian = Matrix6::Identity();
+  Matrix6 best_regularized = Matrix6::Identity();
+  DynamicRejectionDiagnostics best_dyn_diag;
+  bool any_success = false;
+
+  for (std::size_t restart_idx = 0; restart_idx < guesses.size(); ++restart_idx) {
+    Eigen::Isometry3d x0 = Eigen::Isometry3d(guesses[restart_idx].template cast<double>());
+
+    lm_lambda_ = -1.0;
+    converged_ = false;
+    nr_iterations_ = 0;
+    alignment_quality_report_ = AlignmentQualityReport();
+
+    // Reset dynamic rejection state for this restart.
+    dyn_correspondence_residuals_.clear();
+    dyn_correspondence_weights_.clear();
+    dyn_anchor_residuals_.clear();
+    dyn_anchor_weights_.clear();
+    dynamic_rejection_diagnostics_ = DynamicRejectionDiagnostics();
+    dynamic_rejection_diagnostics_.enabled = dynamic_rejection_config_.enable &&
+      dynamic_rejection_config_.kernel != DynamicRejectionKernel::NONE;
+    gnc_mu_current_ = 0.0;
+    gnc_mu_floor_ = 0.0;
+
+    if (lm_debug_print_) {
+      std::cout << "********************************************" << std::endl;
+      std::cout << "***************** optimize *****************" << std::endl;
+      std::cout << "********************************************" << std::endl;
     }
 
-    converged_ = is_converged(delta);
+    int iterations_performed = 0;
+    for (int i = 0; i < max_iterations_ && !converged_; i++) {
+      iterations_performed = i + 1;
+      prepare_dynamic_weights_for_iteration(i);
+      Eigen::Isometry3d delta;
+      if (!step_optimize(x0, delta)) {
+        std::cerr << "lm not converged!!" << std::endl;
+        break;
+      }
+      converged_ = is_converged(delta);
+    }
+
+    nr_iterations_ = iterations_performed;
+    final_transformation_ = x0.cast<float>().matrix();
+
+    // For the final system, use sharp (final) weights so quality metrics reflect
+    // post-rejection state.
+    prepare_dynamic_weights_for_iteration(std::max(max_iterations_,
+      dynamic_rejection_config_.warmup_iterations + 1));
+    PreparedLinearSystem final_system = build_linearized_system(x0, true);
+    final_hessian_ = final_system.raw_hessian;
+    final_regularized_hessian_ = final_system.regularized_hessian;
+    fill_alignment_quality_report(final_system, x0);
+
+    // Basin-suspect post-check: flag if final geometry cost is suspiciously large
+    // (only meaningful when dynamic rejection is on; static-cost baseline isn't
+    // known so we use a conservative ratio comparison vs anchor-included cost).
+    if (dynamic_rejection_config_.basin_verify_enabled) {
+      const double ratio = (final_system.geometry_raw_cost > 0.0 && final_system.cost > 0.0)
+        ? (final_system.cost / final_system.geometry_raw_cost)
+        : 0.0;
+      if (ratio > 1.0 + dynamic_rejection_config_.basin_suspect_cost_ratio) {
+        detail::append_unique_reason(&alignment_quality_report_.rejection_reasons, "basin_suspect");
+      }
+    }
+
+    const double restart_cost = final_system.cost;
+    if (!any_success || restart_cost < best_cost) {
+      best_cost = restart_cost;
+      best_transform = final_transformation_;
+      best_report = alignment_quality_report_;
+      best_hessian = final_hessian_;
+      best_regularized = final_regularized_hessian_;
+      best_dyn_diag = dynamic_rejection_diagnostics_;
+      any_success = true;
+    }
   }
 
-  nr_iterations_ = iterations_performed;
-  final_transformation_ = x0.cast<float>().matrix();
-
-  PreparedLinearSystem final_system = build_linearized_system(x0, true);
-  final_hessian_ = final_system.raw_hessian;
-  final_regularized_hessian_ = final_system.regularized_hessian;
-  fill_alignment_quality_report(final_system, x0);
+  // Restore best-restart state.
+  final_transformation_ = best_transform;
+  final_hessian_ = best_hessian;
+  final_regularized_hessian_ = best_regularized;
+  alignment_quality_report_ = best_report;
+  dynamic_rejection_diagnostics_ = best_dyn_diag;
 
   pcl::transformPointCloud(*input_, output, final_transformation_);
 }
@@ -722,23 +929,35 @@ typename LsqRegistration<PointTarget, PointSource>::Vector6 LsqRegistration<Poin
 }
 
 template <typename PointTarget, typename PointSource>
-double LsqRegistration<PointTarget, PointSource>::sparse_anchor_cost(const Eigen::Isometry3d& trans, Matrix6* H, Vector6* b) const {
+double LsqRegistration<PointTarget, PointSource>::sparse_anchor_cost(const Eigen::Isometry3d& trans, Matrix6* H, Vector6* b) {
   if (!use_sparse_anchors_ || sparse_anchor_source_points_.empty()) {
+    dyn_anchor_residuals_.clear();
     return 0.0;
   }
 
+  const std::size_t n = sparse_anchor_source_points_.size();
+  dyn_anchor_residuals_.assign(n, 0.0);
+  const bool use_runtime_weights = !dyn_anchor_weights_.empty() && dyn_anchor_weights_.size() == n;
+
   double cost = 0.0;
-  for (int i = 0; i < sparse_anchor_source_points_.size(); i++) {
+  for (std::size_t i = 0; i < n; i++) {
     const Eigen::Vector4d source_point(sparse_anchor_source_points_[i].x(), sparse_anchor_source_points_[i].y(), sparse_anchor_source_points_[i].z(), 1.0);
     const Eigen::Vector4d target_point(sparse_anchor_target_points_[i].x(), sparse_anchor_target_points_[i].y(), sparse_anchor_target_points_[i].z(), 1.0);
     const Eigen::Vector4d transformed_source = trans * source_point;
     const Eigen::Vector4d error = target_point - transformed_source;
     const double sigma = sparse_anchor_sigmas_.empty() ? 1.0 : std::max(sparse_anchor_sigmas_[i], 1e-9);
-    const double weight = (sparse_anchor_weights_.empty() ? 1.0 : sparse_anchor_weights_[i]) / (sigma * sigma);
+    const double base_weight = (sparse_anchor_weights_.empty() ? 1.0 : sparse_anchor_weights_[i]) / (sigma * sigma);
+    const double dyn_w = use_runtime_weights ? std::max(0.0, std::min(1.0, dyn_anchor_weights_[i])) : 1.0;
+    const double weight = base_weight * dyn_w;
 
-    cost += weight * error.head<3>().squaredNorm();
+    const double sq_err = error.head<3>().squaredNorm();
+    // Record residual after sigma normalisation so MAD on it has the same units
+    // as Mahalanobis residuals of the geometry side; sigma is per-anchor noise.
+    dyn_anchor_residuals_[i] = sq_err / (sigma * sigma);
 
-    if (H == nullptr || b == nullptr) {
+    cost += weight * sq_err;
+
+    if (H == nullptr || b == nullptr || weight == 0.0) {
       continue;
     }
 

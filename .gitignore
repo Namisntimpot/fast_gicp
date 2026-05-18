@@ -1,5 +1,7 @@
 .vscode/*
 build/*
+build_dyn/*
+build_dyn_cuda/*
 dist/*
 cmake-build/*
 
@@ -10,3 +12,4 @@ README.html
 basic_tutoria.md
 
 *results
+python_tester/dynamic/results/

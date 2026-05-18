@@ -14,6 +14,7 @@
 #include <pcl/registration/registration.h>
 
 #include <fast_gicp/gicp/gicp_settings.hpp>
+#include <fast_gicp/gicp/dynamic_rejection.hpp>
 
 namespace fast_gicp {
 
@@ -89,6 +90,25 @@ public:
     const std::vector<double>& sigmas = std::vector<double>());
   void clearSparseAnchorCorrespondences();
 
+  // --- Dynamic rejection (IRLS / GNC) -------------------------------------
+  // Only supported on classes that override supports_dynamic_rejection() to
+  // return true. Currently: FastGICP (and its 2DGS surfel covariance variant
+  // through the same class) + sparse anchors via this base class.
+  void setDynamicRejectionConfig(const DynamicRejectionConfig& config);
+  void setDynamicRejectionEnabled(bool enable);
+  const DynamicRejectionConfig& getDynamicRejectionConfig() const;
+  const DynamicRejectionDiagnostics& getDynamicRejectionDiagnostics() const;
+  const std::vector<double>& getDynamicCorrespondenceWeights() const { return dyn_correspondence_weights_; }
+  const std::vector<double>& getDynamicCorrespondenceResiduals() const { return dyn_correspondence_residuals_; }
+  const std::vector<double>& getDynamicAnchorWeights() const { return dyn_anchor_weights_; }
+  const std::vector<double>& getDynamicAnchorResiduals() const { return dyn_anchor_residuals_; }
+
+  // Multi-restart: if non-empty, computeTransformation runs from each guess and
+  // picks the lowest final-cost result. The pose passed to align() is used only
+  // when this list is empty.
+  void setMultiRestartInitialGuesses(const std::vector<Eigen::Matrix4f>& guesses);
+  void clearMultiRestartInitialGuesses();
+
   const Matrix6& getFinalHessian() const;
 
   double evaluateCost(const Eigen::Matrix4f& relative_pose, Matrix6* H = nullptr, Vector6* b = nullptr);
@@ -135,8 +155,18 @@ protected:
 
   PreparedLinearSystem build_linearized_system(const Eigen::Isometry3d& trans, bool force_observability_analysis = false);
   Vector6 solve_linearized_system(const Matrix6& H, const Vector6& b, const std::array<int, kLsqDof>& hard_lock_mask) const;
-  double sparse_anchor_cost(const Eigen::Isometry3d& trans, Matrix6* H = nullptr, Vector6* b = nullptr) const;
+  double sparse_anchor_cost(const Eigen::Isometry3d& trans, Matrix6* H = nullptr, Vector6* b = nullptr);
   virtual int current_geometric_term_count() const;
+
+  // Override to true in derived classes that have been wired for dynamic
+  // rejection (FastGICP). Default false; setDynamicRejectionConfig with
+  // enable=true throws when this returns false.
+  virtual bool supports_dynamic_rejection() const { return false; }
+
+  // Called by computeTransformation before each LM iteration. Updates
+  // dyn_correspondence_weights_ and dyn_anchor_weights_ from residuals captured
+  // by the *previous* iteration. No-op when dynamic rejection is disabled.
+  void prepare_dynamic_weights_for_iteration(int iter);
   void store_observability_diagnostics(const PreparedLinearSystem& system);
   Eigen::Isometry3d apply_hard_locks_to_pose(const Eigen::Isometry3d& previous_pose, const Eigen::Isometry3d& candidate_pose) const;
   void fill_alignment_quality_report(const PreparedLinearSystem& system, const Eigen::Isometry3d& final_pose);
@@ -167,6 +197,25 @@ protected:
   std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> sparse_anchor_target_points_;
   std::vector<double> sparse_anchor_weights_;
   std::vector<double> sparse_anchor_sigmas_;
+
+  // Dynamic rejection state ----------------------------------------------------
+  DynamicRejectionConfig dynamic_rejection_config_;
+  DynamicRejectionDiagnostics dynamic_rejection_diagnostics_;
+  // Per-correspondence Mahalanobis squared residuals from the latest linearize.
+  // Populated by FastGICP::linearize (size == correspondences_.size()).
+  // Invalid/skipped correspondences hold -1.0.
+  std::vector<double> dyn_correspondence_residuals_;
+  // Per-correspondence runtime weights in [0,1]. Empty == treat as all 1.0.
+  std::vector<double> dyn_correspondence_weights_;
+  // Per-anchor squared residuals (||t - T s||^2). Populated by sparse_anchor_cost.
+  std::vector<double> dyn_anchor_residuals_;
+  std::vector<double> dyn_anchor_weights_;
+  // GNC schedule state.
+  double gnc_mu_current_;
+  double gnc_mu_floor_;
+
+  // Multi-restart guesses (empty disables the feature).
+  std::vector<Eigen::Matrix4f> multi_restart_guesses_;
 };
 }  // namespace fast_gicp
 

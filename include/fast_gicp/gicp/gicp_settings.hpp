@@ -20,6 +20,47 @@ enum class VoxelAccumulationMode { ADDITIVE, ADDITIVE_WEIGHTED, MULTIPLICATIVE }
 
 enum class SparseAnchorBalanceMode { NONE, BY_COUNT, BY_HESSIAN_TRACE };
 
+enum class DynamicRejectionKernel { NONE, GEMAN_MCCLURE, CAUCHY };
+
+struct DynamicRejectionConfig {
+  bool enable = false;
+  DynamicRejectionKernel kernel = DynamicRejectionKernel::GEMAN_MCCLURE;
+  // Warmup: skip rejection for first N LM iterations to let initial guess settle
+  // (prevents misclassifying static points as dynamic when initial pose is poor).
+  int warmup_iterations = 3;
+  // MAD scale factor (1.4826 -> sigma equivalent for Gaussian).
+  double mad_scale = 1.4826;
+  // GNC mu schedule. mu starts large (convex-like, includes everything),
+  // shrinks toward floor (non-convex, sharp inlier/outlier separation).
+  double gnc_mu_init_scale = 9.0;   // initial mu = (mad_scale * MAD)^2 * gnc_mu_init_scale
+  double gnc_mu_floor_scale = 1.0;  // floor mu  = (mad_scale * MAD)^2 * gnc_mu_floor_scale
+  double gnc_mu_decay = 0.5;        // mu *= decay each schedule step
+  int gnc_steps_per_mu = 2;         // LM iterations between mu shrink steps
+  // Minimum inlier ratio safety floor: if rejection would push below this, clamp.
+  double min_inlier_ratio = 0.1;
+  // Apply rejection to sparse anchors too (using same GNC schedule but per-anchor MAD).
+  bool anchor_rejection_enabled = true;
+  // If basin verify is enabled, append basin_suspect to rejection_reasons when
+  // final cost > basin_suspect_cost_ratio * initial_cost.
+  bool basin_verify_enabled = false;
+  double basin_suspect_cost_ratio = 0.5;
+};
+
+struct DynamicRejectionDiagnostics {
+  bool enabled = false;
+  bool active = false;            // true if warmup passed and rejection took effect
+  int gnc_iterations = 0;          // number of mu shrink steps applied
+  double final_mu = 0.0;           // final mu (residual^2 scale)
+  double inlier_sigma = 0.0;       // MAD-derived sigma
+  int total_correspondences = 0;
+  int inlier_count = 0;            // count with runtime weight > 0.5
+  int anchor_total = 0;
+  int anchor_inlier_count = 0;
+  double mean_inlier_residual = 0.0;
+  double mean_outlier_residual = 0.0;
+};
+
+
 struct ObservabilityConfig {
   bool enable_observability_check = false;
   double relative_eigenvalue_threshold = 1e-3;
