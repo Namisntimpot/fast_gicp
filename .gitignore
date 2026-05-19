@@ -13,3 +13,5 @@ basic_tutoria.md
 
 *results
 python_tester/dynamic/results/
+python_tester/dynamic_cuda/results/
+python_tester/dynamic_lowiter/results/
