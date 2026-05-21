@@ -915,6 +915,12 @@ PYBIND11_MODULE(pygicp, m) {
       }
       g.setTargetCovariances2DGS(rot, scl, mode, normal_sigma_ratio, normal_sigma_min);
     }, py::arg("rotationsq_xyzw"), py::arg("scales_2d"), py::arg("mode") = "physical", py::arg("normal_sigma_ratio") = 0.05, py::arg("normal_sigma_min") = 1e-4)
+    .def("get_source_correspondence", [] (FastGICPCuda& g) {
+      const auto& corr = g.getSourceCorrespondences();
+      const auto& sq = g.getSourceSqDistances();
+      return py::make_tuple(py::array(corr.size(), corr.data()),
+                            py::array(sq.size(), sq.data()));
+    })
   ;
 #endif
 

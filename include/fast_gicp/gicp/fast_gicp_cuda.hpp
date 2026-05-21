@@ -94,6 +94,14 @@ public:
   int getSourceSize() const;
   int getTargetSize() const;
 
+  // Per-source-point correspondence index and squared distance after the
+  // latest align() call. Mirrors FastGICP's getSourceCorrespondences /
+  // getSourceSqDistances so frontend code that probes match quality (e.g.
+  // matched_ratio, keyframe_ratio) works unchanged on the CUDA path. Each
+  // call refreshes the host-side cache via a device->host copy.
+  const std::vector<int>& getSourceCorrespondences() const;
+  const std::vector<float>& getSourceSqDistances() const;
+
 protected:
   virtual bool supports_dynamic_rejection() const override { return true; }
 
@@ -103,6 +111,8 @@ protected:
                            Eigen::Matrix<double, 6, 1>* b = nullptr) override;
   virtual double compute_error(const Eigen::Isometry3d& trans) override;
   virtual int current_geometric_term_count() const override;
+  virtual void collect_alignment_quality_metrics(AlignmentQualityReport* report,
+                                                 const Eigen::Isometry3d& final_pose) const override;
 
 private:
   int k_correspondences_;
@@ -110,6 +120,11 @@ private:
   std::string knn_backend_;
 
   std::unique_ptr<cuda::FastGICPCudaCore> impl_;
+
+  // Host-side caches for the diagnostic accessors above. Mutable because the
+  // getters are const but lazily refresh from the device.
+  mutable std::vector<int> correspondences_host_;
+  mutable std::vector<float> sq_distances_host_;
 };
 
 }  // namespace fast_gicp

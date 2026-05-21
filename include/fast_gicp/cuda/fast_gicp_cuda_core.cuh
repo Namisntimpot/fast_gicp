@@ -97,6 +97,15 @@ class FastGICPCudaCore {
   // Reset iteration-local state at the start of computeTransformation.
   void reset_iteration_state();
 
+  // Download the latest source->target correspondence cache (from the most
+  // recent linearize_geometry call) into host memory. `out_corr` is filled
+  // with N_s ints (-1 if no correspondence), `out_sq_dist` with N_s squared
+  // distances (large sentinel where no correspondence). Used by the frontend
+  // for matched_ratio / keyframe_ratio decisions, mirroring CPU FastGICP's
+  // getSourceCorrespondences / getSourceSqDistances.
+  void download_correspondences(std::vector<int>* out_corr,
+                                std::vector<float>* out_sq_dist) const;
+
  private:
   // Lazy covariance build (runs KNN + per-point cov if dirty).
   void ensure_source_covariances_();

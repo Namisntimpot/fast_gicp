@@ -1,6 +1,10 @@
 #ifndef FAST_GICP_FAST_GICP_CUDA_IMPL_HPP
 #define FAST_GICP_FAST_GICP_CUDA_IMPL_HPP
 
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+
 #include <fast_gicp/gicp/fast_gicp_cuda.hpp>
 #include <fast_gicp/cuda/fast_gicp_cuda_core.cuh>
 
@@ -137,6 +141,22 @@ int FastGICPCuda<PointSource, PointTarget>::getTargetSize() const {
 }
 
 template <typename PointSource, typename PointTarget>
+const std::vector<int>&
+FastGICPCuda<PointSource, PointTarget>::getSourceCorrespondences() const {
+  impl_->download_correspondences(&correspondences_host_, &sq_distances_host_);
+  return correspondences_host_;
+}
+
+template <typename PointSource, typename PointTarget>
+const std::vector<float>&
+FastGICPCuda<PointSource, PointTarget>::getSourceSqDistances() const {
+  // download_correspondences fills both buffers; call again here in case the
+  // user asked for sq-distances without first asking for indices.
+  impl_->download_correspondences(&correspondences_host_, &sq_distances_host_);
+  return sq_distances_host_;
+}
+
+template <typename PointSource, typename PointTarget>
 int FastGICPCuda<PointSource, PointTarget>::current_geometric_term_count() const {
   return impl_->source_size();
 }
@@ -174,6 +194,63 @@ template <typename PointSource, typename PointTarget>
 double FastGICPCuda<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d& trans) {
   impl_->set_correspondence_weights_host(this->dyn_correspondence_weights_);
   return impl_->compute_error_geometry(trans);
+}
+
+// Mirror FastGICP::collect_alignment_quality_metrics so the alignment quality
+// report carries non-zero matched_count / correspondence_count / sq-distance
+// quantiles. Without this, the base class default (no-op) leaves those at 0,
+// which makes downstream code (matched_ratio, normalized_cost_per_match) diverge
+// from the CPU path and corrupts keyframe decisions in the SLAM frontend.
+template <typename PointSource, typename PointTarget>
+void FastGICPCuda<PointSource, PointTarget>::collect_alignment_quality_metrics(
+  AlignmentQualityReport* report,
+  const Eigen::Isometry3d& final_pose) const {
+  (void)final_pose;
+  // Force a device->host refresh of the latest correspondence cache.
+  impl_->download_correspondences(&correspondences_host_, &sq_distances_host_);
+
+  report->has_match_statistics = true;
+  report->correspondence_count = 0;
+  report->matched_count = 0;
+
+  std::vector<double> valid_sq_distances;
+  valid_sq_distances.reserve(sq_distances_host_.size());
+  for (std::size_t i = 0; i < correspondences_host_.size(); ++i) {
+    if (correspondences_host_[i] < 0) {
+      continue;
+    }
+    report->matched_count++;
+    report->correspondence_count++;
+    if (i < sq_distances_host_.size() && std::isfinite(sq_distances_host_[i])) {
+      valid_sq_distances.push_back(static_cast<double>(sq_distances_host_[i]));
+    }
+  }
+
+  if (report->source_count > 0) {
+    report->matched_ratio = static_cast<double>(report->matched_count) /
+                            static_cast<double>(report->source_count);
+  }
+
+  if (valid_sq_distances.empty()) {
+    return;
+  }
+  std::sort(valid_sq_distances.begin(), valid_sq_distances.end());
+  const std::size_t n = valid_sq_distances.size();
+  report->mean_sq_distance =
+    std::accumulate(valid_sq_distances.begin(), valid_sq_distances.end(), 0.0) /
+    static_cast<double>(n);
+  auto pctl = [&](double p) -> double {
+    if (n == 0) return 0.0;
+    const double idx = p * static_cast<double>(n - 1);
+    const std::size_t lo = static_cast<std::size_t>(std::floor(idx));
+    const std::size_t hi = static_cast<std::size_t>(std::ceil(idx));
+    if (lo == hi) return valid_sq_distances[lo];
+    const double frac = idx - static_cast<double>(lo);
+    return valid_sq_distances[lo] * (1.0 - frac) + valid_sq_distances[hi] * frac;
+  };
+  report->median_sq_distance = pctl(0.50);
+  report->p90_sq_distance = pctl(0.90);
+  report->p95_sq_distance = pctl(0.95);
 }
 
 }  // namespace fast_gicp

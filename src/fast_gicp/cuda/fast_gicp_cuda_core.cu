@@ -749,6 +749,28 @@ void FastGICPCudaCore::prepare_dynamic_weights_for_iteration(int /*iter*/) {
   // Phase B4 fills this.
 }
 
+void FastGICPCudaCore::download_correspondences(std::vector<int>* out_corr,
+                                                std::vector<float>* out_sq_dist) const {
+  const std::size_t n = state_->correspondences.size();
+  if (out_corr) {
+    out_corr->resize(n);
+    if (n > 0) {
+      thrust::copy(state_->correspondences.begin(),
+                   state_->correspondences.end(),
+                   out_corr->begin());
+    }
+  }
+  if (out_sq_dist) {
+    const std::size_t m = state_->sq_distances.size();
+    out_sq_dist->resize(m);
+    if (m > 0) {
+      thrust::copy(state_->sq_distances.begin(),
+                   state_->sq_distances.end(),
+                   out_sq_dist->begin());
+    }
+  }
+}
+
 // ---- Covariance build orchestration ---------------------------------------
 namespace {
 
