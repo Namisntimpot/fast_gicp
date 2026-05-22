@@ -193,10 +193,190 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
     return;
   }
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputTarget(cloud);
-  search_target_->setInputCloud(cloud);
+  if (target_kdtree_mode_ == "incremental") {
+    // Dynamic path: rebuild dynamic adaptor instead of the PCL static tree.
+    // Bit-identical KNN to a fresh PCL rebuild only modulo tie-break order.
+    if (!dynamic_search_target_) {
+      dynamic_search_target_.reset(new NanoflannDynamicSearch<PointTarget>());
+    }
+    dynamic_search_target_->setInputCloud(cloud);
+  } else {
+    search_target_->setInputCloud(cloud);
+  }
   target_covs_.clear();
   target_rotationsq_.clear();
   target_scales_.clear();
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setTargetKdtreeMode(const std::string& mode) {
+  if (mode != "static" && mode != "incremental") {
+    throw std::invalid_argument("FastGICP::setTargetKdtreeMode: unknown mode '" + mode + "' (expected 'static' or 'incremental')");
+  }
+  target_kdtree_mode_ = mode;
+  if (mode == "incremental" && !dynamic_search_target_) {
+    dynamic_search_target_.reset(new NanoflannDynamicSearch<PointTarget>());
+  }
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+int FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::appendInputTarget(
+    const std::vector<float>& xyz_flat,
+    const std::vector<float>& rotationsq_xyzw,
+    const std::vector<float>& scales_2d,
+    const std::string& mode,
+    double normal_sigma_ratio,
+    double normal_sigma_min) {
+  if (target_kdtree_mode_ != "incremental") {
+    throw std::runtime_error("FastGICP::appendInputTarget requires target_kdtree_mode='incremental'");
+  }
+  if (!dynamic_search_target_) {
+    dynamic_search_target_.reset(new NanoflannDynamicSearch<PointTarget>());
+  }
+  const std::size_t n_new = xyz_flat.size() / 3;
+  if (xyz_flat.size() != 3 * n_new) {
+    throw std::invalid_argument("appendInputTarget: xyz_flat size must be multiple of 3");
+  }
+  if (rotationsq_xyzw.size() != 4 * n_new || scales_2d.size() != 2 * n_new) {
+    throw std::invalid_argument("appendInputTarget: rot/scale size mismatch with n_new");
+  }
+  const std::size_t first_idx = dynamic_search_target_->appendPoints(xyz_flat.data(), n_new);
+
+  // Sync the PCL target cloud with appended points so target_->at(idx) still
+  // maps to the correct xyz inside update_correspondences and linearize. The
+  // base-class member target_ is a ConstPtr; we keep a mutable shadow we own.
+  PointCloudTargetPtr mut_cloud;
+  if (target_) {
+    // Cast away const on the cloud we previously installed; we own the
+    // storage in incremental mode, so this is safe.
+    mut_cloud = std::const_pointer_cast<PointCloudTarget>(target_);
+  } else {
+    mut_cloud.reset(new PointCloudTarget());
+  }
+  mut_cloud->points.reserve(mut_cloud->size() + n_new);
+  for (std::size_t i = 0; i < n_new; ++i) {
+    PointTarget p;
+    p.x = xyz_flat[3 * i + 0];
+    p.y = xyz_flat[3 * i + 1];
+    p.z = xyz_flat[3 * i + 2];
+    mut_cloud->points.push_back(p);
+  }
+  mut_cloud->width = static_cast<std::uint32_t>(mut_cloud->points.size());
+  mut_cloud->height = 1;
+  // Re-install via base-class setInputTarget so target_ reflects the growth.
+  // We bypass our override because that would clear covs/rot/scales.
+  pcl::Registration<PointSource, PointTarget, Scalar>::target_ = mut_cloud;
+
+  // Extend per-point 2DGS attributes and compute covariances for the new
+  // slice only. Uses the same regularization path as setTargetCovariances2DGS.
+  const std::size_t old_n = target_covs_.size();
+  target_covs_.resize(old_n + n_new);
+  target_rotationsq_.resize(4 * (old_n + n_new));
+  target_scales_.resize(3 * (old_n + n_new));
+
+  if (mode != "physical" && mode != "normalized") {
+    throw std::invalid_argument("appendInputTarget: unknown 2DGS mode '" + mode + "'");
+  }
+
+#pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
+  for (int i = 0; i < static_cast<int>(n_new); ++i) {
+    const std::size_t k = old_n + i;
+    const double s1 = std::max(static_cast<double>(scales_2d[2 * i + 0]), 1e-12);
+    const double s2 = std::max(static_cast<double>(scales_2d[2 * i + 1]), 1e-12);
+    const double sn = std::max(normal_sigma_ratio * std::min(s1, s2), normal_sigma_min);
+
+    target_scales_[3 * k + 0] = static_cast<float>(s1);
+    target_scales_[3 * k + 1] = static_cast<float>(s2);
+    target_scales_[3 * k + 2] = static_cast<float>(sn);
+
+    const double qx = static_cast<double>(rotationsq_xyzw[4 * i + 0]);
+    const double qy = static_cast<double>(rotationsq_xyzw[4 * i + 1]);
+    const double qz = static_cast<double>(rotationsq_xyzw[4 * i + 2]);
+    const double qw = static_cast<double>(rotationsq_xyzw[4 * i + 3]);
+    target_rotationsq_[4 * k + 0] = static_cast<float>(qx);
+    target_rotationsq_[4 * k + 1] = static_cast<float>(qy);
+    target_rotationsq_[4 * k + 2] = static_cast<float>(qz);
+    target_rotationsq_[4 * k + 3] = static_cast<float>(qw);
+    Eigen::Quaterniond q(qw, qx, qy, qz);
+    q.normalize();
+
+    Eigen::Vector3d singular_values;
+    if (mode == "normalized") {
+      singular_values = Eigen::Vector3d(1.0, 1.0, 1e-3);
+    } else {
+      singular_values = Eigen::Vector3d(s1 * s1, s2 * s2, sn * sn);
+    }
+    target_covs_[k].setZero();
+    target_covs_[k].template block<3, 3>(0, 0) =
+        q.toRotationMatrix() * singular_values.asDiagonal() * q.toRotationMatrix().transpose();
+  }
+  return static_cast<int>(first_idx);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+int FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::removeFromInputTarget(
+    const std::vector<int>& indices) {
+  if (target_kdtree_mode_ != "incremental") {
+    throw std::runtime_error("FastGICP::removeFromInputTarget requires target_kdtree_mode='incremental'");
+  }
+  if (!dynamic_search_target_) return 0;
+  return static_cast<int>(dynamic_search_target_->removePoints(
+      reinterpret_cast<const std::int32_t*>(indices.data()), indices.size()));
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+std::vector<int> FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::rebuildTargetKdtree() {
+  if (target_kdtree_mode_ != "incremental") {
+    throw std::runtime_error("FastGICP::rebuildTargetKdtree requires target_kdtree_mode='incremental'");
+  }
+  if (!dynamic_search_target_) return {};
+  std::vector<std::int32_t> remap = dynamic_search_target_->compact();
+
+  // Re-index target_ + 2DGS arrays to match the compaction.
+  const std::size_t old_total = remap.size();
+  std::size_t live = 0;
+  for (auto v : remap) {
+    if (v >= 0) ++live;
+  }
+  PointCloudTargetPtr new_target(new PointCloudTarget());
+  new_target->points.resize(live);
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> new_covs(live);
+  std::vector<float> new_rot(4 * live);
+  std::vector<float> new_scales(3 * live);
+  for (std::size_t i = 0; i < old_total; ++i) {
+    const std::int32_t j = remap[i];
+    if (j < 0) continue;
+    new_target->points[j] = target_->at(i);
+    new_covs[j] = target_covs_[i];
+    for (int d = 0; d < 4; ++d) new_rot[4 * j + d] = target_rotationsq_[4 * i + d];
+    for (int d = 0; d < 3; ++d) new_scales[3 * j + d] = target_scales_[3 * i + d];
+  }
+  new_target->width = static_cast<std::uint32_t>(live);
+  new_target->height = 1;
+  target_ = new_target;
+  pcl::Registration<PointSource, PointTarget, Scalar>::target_ = target_;
+  target_covs_.swap(new_covs);
+  target_rotationsq_.swap(new_rot);
+  target_scales_.swap(new_scales);
+  return std::vector<int>(remap.begin(), remap.end());
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+std::size_t FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::getLiveTargetCount() const {
+  return dynamic_search_target_ ? dynamic_search_target_->liveCount() : (target_ ? target_->size() : 0);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+std::size_t FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::getTotalTargetCount() const {
+  return dynamic_search_target_ ? dynamic_search_target_->totalCount() : (target_ ? target_->size() : 0);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::getTargetTombstoneRatio() const {
+  if (!dynamic_search_target_) return 0.0;
+  const std::size_t total = dynamic_search_target_->totalCount();
+  if (total == 0) return 0.0;
+  return static_cast<double>(dynamic_search_target_->tombstonedCount()) / static_cast<double>(total);
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -370,13 +550,19 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   std::vector<int> k_indices(candidate_count);
   std::vector<float> k_sq_dists(candidate_count);
 
+  const bool use_dynamic = (target_kdtree_mode_ == "incremental") && (dynamic_search_target_ != nullptr);
+
 #pragma omp parallel for num_threads(num_threads_) firstprivate(k_indices, k_sq_dists) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
     PointTarget pt;
-    
+
     pt.getVector4fMap() = trans_f * input_->at(i).getVector4fMap();
 
-    search_target_->nearestKSearch(pt, candidate_count, k_indices, k_sq_dists);
+    if (use_dynamic) {
+      dynamic_search_target_->nearestKSearch(pt, candidate_count, k_indices, k_sq_dists);
+    } else {
+      search_target_->nearestKSearch(pt, candidate_count, k_indices, k_sq_dists);
+    }
 
     int best_index = -1;
     float best_sq_dist = std::numeric_limits<float>::max();

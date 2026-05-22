@@ -851,6 +851,47 @@ PYBIND11_MODULE(pygicp, m) {
       const auto input_filter = filter.cast<std::vector<int>>();
     	gicp.setTargetFilter(num_trackable, input_filter);
     })
+    // ---- Phase 1: incremental target KD-tree (delta API) -----------------
+    .def("set_target_kdtree_mode", &FastGICP::setTargetKdtreeMode,
+         py::arg("mode"),
+         "mode='static' (default, PCL KdTreeFLANN with full rebuild on set_input_target) "
+         "or 'incremental' (NanoflannDynamicSearch with append + tombstone)")
+    .def("get_target_kdtree_mode", &FastGICP::getTargetKdtreeMode)
+    .def("append_input_target", [] (FastGICP& gicp,
+                                    py::array xyz,
+                                    py::array rotationsq_xyzw,
+                                    py::array scales_2d,
+                                    const std::string& mode,
+                                    double normal_sigma_ratio,
+                                    double normal_sigma_min) {
+      const auto xyz_flat = numpy_to_float_list(xyz);
+      const auto rot = numpy_to_float_list(rotationsq_xyzw);
+      const auto sc = numpy_to_float_list(scales_2d);
+      if (xyz_flat.size() % 3 != 0) {
+        throw std::invalid_argument("[append_input_target] xyz must be Nx3");
+      }
+      const std::size_t n = xyz_flat.size() / 3;
+      if (rot.size() != 4 * n || sc.size() != 2 * n) {
+        throw std::invalid_argument("[append_input_target] rot/scales size mismatch with N");
+      }
+      return gicp.appendInputTarget(xyz_flat, rot, sc, mode, normal_sigma_ratio, normal_sigma_min);
+    },
+         py::arg("xyz"), py::arg("rotationsq_xyzw"), py::arg("scales_2d"),
+         py::arg("mode") = "physical",
+         py::arg("normal_sigma_ratio") = 0.05,
+         py::arg("normal_sigma_min") = 1e-4)
+    .def("remove_from_input_target", [] (FastGICP& gicp, py::array indices) {
+      const auto idx = indices.cast<std::vector<int>>();
+      return gicp.removeFromInputTarget(idx);
+    })
+    .def("rebuild_target_kdtree", [] (FastGICP& gicp) {
+      const auto remap = gicp.rebuildTargetKdtree();
+      return py::array(remap.size(), remap.data());
+    },
+         "Compact tombstones and rebuild. Returns old_idx -> new_idx (or -1) remap.")
+    .def("get_live_target_count", &FastGICP::getLiveTargetCount)
+    .def("get_total_target_count", &FastGICP::getTotalTargetCount)
+    .def("get_target_tombstone_ratio", &FastGICP::getTargetTombstoneRatio)
   ;
 
   py::class_<FastVGICP, FastGICP, std::shared_ptr<FastVGICP>>(m, "FastVGICP")

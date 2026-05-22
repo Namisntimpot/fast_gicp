@@ -12,6 +12,7 @@
 
 #include <fast_gicp/gicp/lsq_registration.hpp>
 #include <fast_gicp/gicp/gicp_settings.hpp>
+#include <fast_gicp/search/nanoflann_dynamic_search.hpp>
 #include <ctime>
 
 namespace fast_gicp {
@@ -113,6 +114,36 @@ public:
   const int getTargetRotationsqSize() const {return target_rotationsq_.size();}
   const int getTargetScaleSize() const {return target_scales_.size();}
 
+  // ---- Incremental target KD-tree API (Phase 1) -----------------------------
+  // Mode toggles which structure backs target nearest-neighbor queries:
+  //   "static"      — PCL KdTreeFLANN (default; full rebuild on setInputTarget)
+  //   "incremental" — NanoflannDynamicSearch (append-only, tombstone removes)
+  // In incremental mode setInputTarget() still works as a full rebuild; the
+  // delta methods below skip the rebuild.
+  void setTargetKdtreeMode(const std::string& mode);
+  const std::string& getTargetKdtreeMode() const { return target_kdtree_mode_; }
+
+  // Append n new target points + 2DGS attrs. Returns the first new index.
+  // Only valid in "incremental" mode.
+  int appendInputTarget(
+      const std::vector<float>& xyz_flat,
+      const std::vector<float>& rotationsq_xyzw,
+      const std::vector<float>& scales_2d,
+      const std::string& mode,
+      double normal_sigma_ratio,
+      double normal_sigma_min);
+
+  // Tombstone-remove the listed indices. Returns count actually removed.
+  int removeFromInputTarget(const std::vector<int>& indices);
+
+  // Compact and rebuild on live points only. Returns the old_idx -> new_idx
+  // mapping (caller is responsible for re-indexing any external state).
+  std::vector<int> rebuildTargetKdtree();
+
+  std::size_t getLiveTargetCount() const;
+  std::size_t getTotalTargetCount() const;
+  double getTargetTombstoneRatio() const;
+
   const std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& getSourceCovariances() const {return source_covs_;}
   const std::vector<float>& getSourceRotationsq() const {
   	// if (input_->size() * 4 != source_rotationsq_.size()){ std::cerr << "source and quaternions size mismatch. Did you change source?"<<std::endl;}
@@ -209,6 +240,13 @@ protected:
 
   std::shared_ptr<SearchMethodSource> search_source_;
   std::shared_ptr<SearchMethodTarget> search_target_;
+
+  // Phase 1: parallel dynamic backend for target. Active when
+  // target_kdtree_mode_ == "incremental". The PCL search_target_ is kept
+  // allocated so that legacy code paths (e.g. calculate_covariances) that
+  // rely on it continue to work for source side.
+  std::shared_ptr<NanoflannDynamicSearch<PointTarget>> dynamic_search_target_;
+  std::string target_kdtree_mode_ = "static";
 
   std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> source_covs_;
 //  std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> source_rotationsq_;

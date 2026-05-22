@@ -70,6 +70,7 @@ if (OPENMP_FOUND)
 endif ()
 target_include_directories(fast_gicp PUBLIC
   include
+  thirdparty/nanoflann/include
   ${PCL_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
 )
@@ -99,6 +100,7 @@ if(BUILD_PYTHON_BINDINGS)
   )
   target_include_directories(pygicp PUBLIC
     include
+    thirdparty/nanoflann/include
     ${PCL_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
   )
