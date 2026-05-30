@@ -630,6 +630,13 @@ PYBIND11_MODULE(pygicp, m) {
         }
     ))
     .def("set_num_threads", &FastGICP::setNumThreads)
+    .def("get_num_threads", &FastGICP::getNumThreads)
+    .def("set_max_iterations", [] (FastGICP& gicp, int n) {
+      gicp.setMaximumIterations(n);
+    })
+    .def("get_max_iterations", [] (FastGICP& gicp) {
+      return gicp.getMaximumIterations();
+    })
     .def("set_correspondence_randomness", &FastGICP::setCorrespondenceRandomness)
     .def("set_max_correspondence_distance", &FastGICP::setMaxCorrespondenceDistance)
     .def("set_max_knn_distance", &FastGICP::setKNNMaxDistance)

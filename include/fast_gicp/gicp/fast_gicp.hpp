@@ -52,6 +52,7 @@ public:
   virtual ~FastGICP() override;
 
   void setNumThreads(int n);
+  int getNumThreads() const { return num_threads_; }
   void setCorrespondenceRandomness(int k);
   void setRegularizationMethod(RegularizationMethod method);
   void setKNNMaxDistance(float k);
