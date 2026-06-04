@@ -1,17 +1,79 @@
-cmake_minimum_required(VERSION 3.10.0)
+cmake_minimum_required(VERSION 3.15.0)
 project(fast_gicp)
 
+# Headless-server friendly defaults: nothing that needs a display is built
+# unless explicitly requested. The apps (gicp_align / gicp_kitti) link PCL
+# visualization paths and need X at runtime, so they default to OFF.
 option(BUILD_VGICP_CUDA "Build GPU-powered VGICP" OFF)
-option(BUILD_apps "Build application programs" ON)
+option(BUILD_apps "Build application programs (need a display at runtime)" OFF)
 option(BUILD_test "Build test programs" OFF)
 option(BUILD_benchmarks "Build benchmark programs" OFF)
 option(BUILD_PYTHON_BINDINGS "Build python bindings" OFF)
 
-set(CMAKE_BUILD_TYPE "Release")
+# Version string baked into the python module as pygicp.__version__
+# (set by setup.py to "<base>+<git-branch>.<git-sha>[.dirty]").
+set(FAST_GICP_VERSION_INFO "" CACHE STRING
+  "Version string embedded into pygicp.__version__")
 
-find_package(PCL REQUIRED COMPONENTS common io filters search registration)
-find_package(Eigen3 REQUIRED)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release")
+endif()
+
+#############################################
+## Dependency search: conda first, then OS ##
+#############################################
+# Every find_package() below searches the active conda environment first
+# (CMAKE_PREFIX_PATH front), then falls back to the default system locations,
+# and finally fails with an actionable error message.
+set(FAST_GICP_CONDA_PREFIX "")
+if(DEFINED ENV{CONDA_PREFIX} AND NOT "$ENV{CONDA_PREFIX}" STREQUAL "")
+  set(FAST_GICP_CONDA_PREFIX "$ENV{CONDA_PREFIX}")
+  list(PREPEND CMAKE_PREFIX_PATH "${FAST_GICP_CONDA_PREFIX}")
+  if(NOT DEFINED BOOST_ROOT AND EXISTS "${FAST_GICP_CONDA_PREFIX}/include/boost")
+    set(BOOST_ROOT "${FAST_GICP_CONDA_PREFIX}")
+  endif()
+  message(STATUS "fast_gicp: preferring dependencies from conda env: ${FAST_GICP_CONDA_PREFIX}")
+else()
+  message(STATUS "fast_gicp: no conda env active, using system dependencies")
+endif()
+
+find_package(PCL QUIET COMPONENTS common io filters search registration)
+if(NOT PCL_FOUND)
+  message(FATAL_ERROR
+    "fast_gicp: PCL was not found.\n"
+    "Searched the active conda env first (CONDA_PREFIX='${FAST_GICP_CONDA_PREFIX}'), then system paths.\n"
+    "Install one of:\n"
+    "  conda/mamba install -c conda-forge pcl boost-cpp eigen\n"
+    "  sudo apt install libpcl-dev\n"
+    "or pass -DPCL_DIR=<dir containing PCLConfig.cmake>.")
+endif()
+message(STATUS "fast_gicp: PCL ${PCL_VERSION} (${PCL_DIR})")
 add_definitions(${PCL_DEFINITIONS})
+
+find_package(Eigen3 QUIET)
+if(TARGET Eigen3::Eigen AND NOT EIGEN3_INCLUDE_DIR)
+  get_target_property(EIGEN3_INCLUDE_DIR Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+endif()
+if(NOT EIGEN3_INCLUDE_DIR)
+  # Manual fallback: conda env include dir, then standard system locations.
+  foreach(_eigen_cand
+      "${FAST_GICP_CONDA_PREFIX}/include/eigen3"
+      "/usr/include/eigen3"
+      "/usr/local/include/eigen3")
+    if(NOT EIGEN3_INCLUDE_DIR AND EXISTS "${_eigen_cand}/Eigen/Core")
+      set(EIGEN3_INCLUDE_DIR "${_eigen_cand}")
+    endif()
+  endforeach()
+endif()
+if(NOT EIGEN3_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "fast_gicp: Eigen3 was not found (conda env first, then system).\n"
+    "Install one of:\n"
+    "  conda/mamba install -c conda-forge eigen\n"
+    "  sudo apt install libeigen3-dev\n"
+    "or pass -DEIGEN3_INCLUDE_DIR=<dir containing Eigen/Core>.")
+endif()
+message(STATUS "fast_gicp: Eigen3 include dir: ${EIGEN3_INCLUDE_DIR}")
 
 if(DEFINED ENV{ROS_VERSION})
   set(ROS_VERSION $ENV{ROS_VERSION})
@@ -34,7 +96,77 @@ if (OPENMP_FOUND)
 endif()
 
 if(BUILD_VGICP_CUDA)
-  find_package(CUDA REQUIRED)
+  # CUDA toolkit lookup order: FAST_GICP_CUDA_ROOT env var, conda env
+  # (only when its layout is complete enough for FindCUDA: nvcc + headers
+  # in <root>/include), then FindCUDA's own defaults (nvcc on PATH,
+  # /usr/local/cuda). Each candidate that fails is discarded and the next
+  # one is tried; only when all fail do we error out.
+  set(_fast_gicp_cuda_roots "")
+  if(DEFINED ENV{FAST_GICP_CUDA_ROOT} AND EXISTS "$ENV{FAST_GICP_CUDA_ROOT}/bin/nvcc")
+    list(APPEND _fast_gicp_cuda_roots "$ENV{FAST_GICP_CUDA_ROOT}")
+  endif()
+  if(NOT "${FAST_GICP_CONDA_PREFIX}" STREQUAL ""
+     AND EXISTS "${FAST_GICP_CONDA_PREFIX}/bin/nvcc"
+     AND EXISTS "${FAST_GICP_CONDA_PREFIX}/include/cuda_runtime.h")
+    # Only a complete conda toolkit layout; the split conda cuda packages
+    # (headers under targets/<arch>/, nvcc without its profile) cannot be
+    # driven by FindCUDA and are skipped in favour of the system toolkit.
+    list(APPEND _fast_gicp_cuda_roots "${FAST_GICP_CONDA_PREFIX}")
+  endif()
+  if(EXISTS "/usr/local/cuda/bin/nvcc")
+    list(APPEND _fast_gicp_cuda_roots "/usr/local/cuda")
+  endif()
+  list(APPEND _fast_gicp_cuda_roots "DEFAULT")
+  list(GET FAST_GICP_CUDA_ARCH 0 _fast_gicp_smoke_arch)
+  foreach(_cuda_root ${_fast_gicp_cuda_roots})
+    if(NOT CUDA_FOUND)
+      foreach(_v CUDA_TOOLKIT_ROOT_DIR CUDA_NVCC_EXECUTABLE CUDA_TOOLKIT_INCLUDE
+                 CUDA_CUDART_LIBRARY CUDA_CUDA_LIBRARY CUDA_VERSION
+                 CUDA_cublas_LIBRARY CUDA_cufft_LIBRARY CUDA_cupti_LIBRARY
+                 CUDA_curand_LIBRARY CUDA_cusolver_LIBRARY CUDA_cusparse_LIBRARY)
+        unset(${_v} CACHE)
+        unset(${_v})
+      endforeach()
+      if(NOT "${_cuda_root}" STREQUAL "DEFAULT")
+        set(CUDA_TOOLKIT_ROOT_DIR "${_cuda_root}")
+        message(STATUS "fast_gicp: trying CUDA toolkit at ${_cuda_root}")
+      else()
+        message(STATUS "fast_gicp: trying default CUDA toolkit search (PATH, /usr/local/cuda)")
+      endif()
+      find_package(CUDA QUIET)
+      if(CUDA_FOUND)
+        # Smoke test: FindCUDA accepting a root does not guarantee nvcc can
+        # actually compile (e.g. conda's split packaging loses cicc), nor
+        # that it supports the requested arch. Reject broken candidates.
+        set(_smoke_src "${CMAKE_BINARY_DIR}/fast_gicp_nvcc_smoke.cu")
+        if(NOT EXISTS "${_smoke_src}")
+          file(WRITE "${_smoke_src}"
+            "__global__ void fast_gicp_smoke_kernel() {}\nint main() { return 0; }\n")
+        endif()
+        execute_process(
+          COMMAND "${CUDA_NVCC_EXECUTABLE}" -std=c++17
+                  -gencode=arch=compute_${_fast_gicp_smoke_arch},code=sm_${_fast_gicp_smoke_arch}
+                  -o "${CMAKE_BINARY_DIR}/fast_gicp_nvcc_smoke.o" -c "${_smoke_src}"
+          RESULT_VARIABLE _smoke_rc
+          OUTPUT_VARIABLE _smoke_out
+          ERROR_VARIABLE _smoke_err)
+        if(NOT _smoke_rc EQUAL 0)
+          message(STATUS
+            "fast_gicp: rejecting CUDA at ${CUDA_TOOLKIT_ROOT_DIR} -- nvcc "
+            "smoke test failed (sm_${_fast_gicp_smoke_arch}): ${_smoke_err}")
+          set(CUDA_FOUND FALSE)
+        endif()
+      endif()
+    endif()
+  endforeach()
+  if(NOT CUDA_FOUND)
+    message(FATAL_ERROR
+      "fast_gicp: BUILD_VGICP_CUDA=ON but no usable CUDA toolkit was found "
+      "(checked FAST_GICP_CUDA_ROOT, conda env, PATH, /usr/local/cuda).\n"
+      "Either install a CUDA toolkit, point FAST_GICP_CUDA_ROOT at one, "
+      "or build CPU-only with FAST_GICP_BUILD_VGICP_CUDA=0.")
+  endif()
+  message(STATUS "fast_gicp: CUDA ${CUDA_VERSION} (${CUDA_TOOLKIT_ROOT_DIR})")
   include_directories(${CUDA_INCLUDE_DIRS})
   link_directories(${CUDA_LIBRARY_DIRS})
 endif()
@@ -94,7 +226,15 @@ endif()
 
 ### Python bindings ###
 if(BUILD_PYTHON_BINDINGS)
-  find_package(pybind11 CONFIG REQUIRED)
+  find_package(pybind11 CONFIG QUIET)
+  if(NOT pybind11_FOUND)
+    message(FATAL_ERROR
+      "fast_gicp: pybind11 was not found (conda env first, then system).\n"
+      "Install one of:\n"
+      "  pip install pybind11\n"
+      "  conda/mamba install -c conda-forge pybind11\n"
+      "or pass -Dpybind11_DIR=<dir containing pybind11Config.cmake>.")
+  endif()
   pybind11_add_module(pygicp
     src/python/main.cpp
   )
@@ -107,6 +247,11 @@ if(BUILD_PYTHON_BINDINGS)
   target_link_libraries(pygicp PRIVATE
     fast_gicp
   )
+  if(NOT "${FAST_GICP_VERSION_INFO}" STREQUAL "")
+    # Exposed as pygicp.__version__ (see src/python/main.cpp).
+    target_compile_definitions(pygicp PRIVATE
+      VERSION_INFO=${FAST_GICP_VERSION_INFO})
+  endif()
 endif()
 
 ### CUDA ###
@@ -160,9 +305,6 @@ if(BUILD_VGICP_CUDA)
   # ---- new FastGICPCuda library (clean, no nvbio) ----
   # Built as a separate target so that pre-existing nvbio/VGICP issues under
   # newer CUDA toolchains don't block the new classic-GICP CUDA path.
-  # B1: only the FastGICPCuda skeleton. Brute-force KNN will be added in B2
-  # with a nvbio-free implementation suitable for source < 100k & target up to
-  # several hundred K (heap-of-K maintained per source thread).
   cuda_add_library(fast_gicp_cuda_kernels SHARED
     src/fast_gicp/cuda/fast_gicp_cuda_core.cu
   )

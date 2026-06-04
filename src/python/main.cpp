@@ -21,6 +21,11 @@
 #include <pcl/console/print.h>
 #include <pcl/filters/approximate_voxel_grid.h>
 
+// Used to expose the build version (set by setup.py via -DVERSION_INFO=...)
+// as pygicp.__version__; see the end of PYBIND11_MODULE below.
+#define STRINGIFY(x) #x
+#define MACRO_STRINGIFY(x) STRINGIFY(x)
+
 namespace py = pybind11;
 
 namespace {

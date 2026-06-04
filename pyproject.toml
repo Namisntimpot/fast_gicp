@@ -1,0 +1,10 @@
+# Build configuration for pygicp (fast_gicp python bindings).
+# Metadata/logic live in setup.py; this file only declares the build backend
+# so `pip install -e .` works reliably on modern pip.
+#
+# If the machine has no network access for pip's isolated build env, use:
+#   pip install -e . --no-build-isolation
+# (then setuptools + pybind11 must be available in the active environment).
+[build-system]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
