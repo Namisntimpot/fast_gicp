@@ -173,6 +173,35 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   source_covs_.clear();
   source_rotationsq_.clear();
   source_scales_.clear();
+  // EXP-124: a new source invalidates any previously-set flow correspondences.
+  flow_corr_.clear();
+}
+
+// ---- EXP-124: dense-optical-flow correspondences --------------------------------
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setFlowCorrespondences(
+    const std::vector<int>& src_idx, const std::vector<int>& tgt_idx) {
+  const std::size_t n_src = input_ ? input_->size() : 0;
+  flow_corr_.assign(n_src, -1);
+  const std::size_t m = std::min(src_idx.size(), tgt_idx.size());
+  for (std::size_t k = 0; k < m; k++) {
+    const int s = src_idx[k];
+    const int t = tgt_idx[k];
+    if (s >= 0 && s < (int)n_src && t >= 0) {
+      flow_corr_[s] = t;
+    }
+  }
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::setUseFlowCorrespondences(bool use_flow) {
+  use_flow_corr_ = use_flow;
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::clearFlowCorrespondences() {
+  flow_corr_.clear();
+  use_flow_corr_ = false;
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
@@ -380,6 +409,31 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
 }
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::queryTargetNN(
+    const std::vector<float>& query_xyz, std::vector<int>& indices, std::vector<float>& sq_distances) {
+  const int n = static_cast<int>(query_xyz.size() / 3);
+  indices.assign(n, -1);
+  sq_distances.assign(n, std::numeric_limits<float>::infinity());
+  const bool use_dynamic = (target_kdtree_mode_ == "incremental") && (dynamic_search_target_ != nullptr);
+  if (!use_dynamic && !search_target_) return;
+#pragma omp parallel for num_threads(num_threads_) schedule(guided, 64)
+  for (int i = 0; i < n; i++) {
+    PointTarget pt;
+    pt.x = query_xyz[3 * i + 0];
+    pt.y = query_xyz[3 * i + 1];
+    pt.z = query_xyz[3 * i + 2];
+    std::vector<int> k_idx(1);
+    std::vector<float> k_d2(1);
+    int found = use_dynamic ? dynamic_search_target_->nearestKSearch(pt, 1, k_idx, k_d2)
+                            : search_target_->nearestKSearch(pt, 1, k_idx, k_d2);
+    if (found > 0) {
+      indices[i] = k_idx[0];
+      sq_distances[i] = k_d2[0];
+    }
+  }
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 bool FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::color_matching_ready() const {
   return color_matching_config_.enable_color_matching &&
          color_matching_config_.color_weight > 0.0 &&
@@ -557,6 +611,31 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
     PointTarget pt;
 
     pt.getVector4fMap() = trans_f * input_->at(i).getVector4fMap();
+
+    // EXP-124: dense-flow correspondence OVERRIDE. If a flow target index is set
+    // for this source point, use it directly (bypassing the NN kdtree search AND
+    // the corr_dist_threshold_ gate), build the Mahalanobis matrix from that
+    // target's covariance (identical RCR formula to the NN path), and skip ahead.
+    if (use_flow_corr_ && i < (int)flow_corr_.size() && flow_corr_[i] >= 0) {
+      const int target_index = flow_corr_[i];
+      // squared residual between transformed source and the flow-matched target
+      const Eigen::Vector4f resid = pt.getVector4fMap() - target_->at(target_index).getVector4fMap();
+      sq_distances_[i] = resid.head<3>().squaredNorm();
+      correspondences_[i] = target_index;
+
+      const auto& cov_A = source_covs_[i];
+      const auto& cov_B = target_covs_[target_index];
+      Eigen::Matrix4d RCR = cov_B + trans.matrix() * cov_A * trans.matrix().transpose();
+      RCR(3, 3) = 1.0;
+      if (RCR.determinant() == 0) {
+        mahalanobis_[i] = RCR.completeOrthogonalDecomposition().pseudoInverse();
+        mahalanobis_[i](3, 3) = 0.0f;
+      } else {
+        mahalanobis_[i] = RCR.inverse();
+        mahalanobis_[i](3, 3) = 0.0f;
+      }
+      continue;
+    }
 
     if (use_dynamic) {
       dynamic_search_target_->nearestKSearch(pt, candidate_count, k_indices, k_sq_dists);

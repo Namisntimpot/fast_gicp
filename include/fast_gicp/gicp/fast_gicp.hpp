@@ -100,6 +100,17 @@ public:
   virtual void setSourceFilter(const int num_trackable_points, const std::vector<int>& input_filter);
   virtual void setTargetFilter(const int num_trackable_points, const std::vector<int>& input_filter);
 
+  // ---- EXP-124: dense-optical-flow correspondences ----------------------------
+  // Override the per-source-point nearest-neighbor data association with an
+  // externally supplied (flow-derived) source->target index map. src_idx[m] is a
+  // source-point index, tgt_idx[m] the target-point index it should correspond to.
+  // Indices not covered keep the value -1 (fall back to NN). Must be set AFTER
+  // setInputSource() (which clears the map) and BEFORE align(). When the flow map
+  // is active, the matched source points BYPASS the corr_dist_threshold_ gate.
+  void setFlowCorrespondences(const std::vector<int>& src_idx, const std::vector<int>& tgt_idx);
+  void setUseFlowCorrespondences(bool use_flow);
+  void clearFlowCorrespondences();
+
   const std::vector<int>& getSourceCorrespondences() const { 
   	if (input_->size() != correspondences_.size()){ std::cerr<< "source and correspondence size mismatch. Did you change src after align()?"<<std::endl;}
   	return correspondences_; }
@@ -122,6 +133,17 @@ public:
   // delta methods below skip the rebuild.
   void setTargetKdtreeMode(const std::string& mode);
   const std::string& getTargetKdtreeMode() const { return target_kdtree_mode_; }
+
+  // ---- accel: target NN query --------------------------------------------------
+  // 1-NN of each query point (flattened xyz, length 3N) into the CURRENT target
+  // KD-tree. Lets the dense-flow correspondence builder reuse THIS tree instead of
+  // building a second (scipy) tree over the same target points. Fills `indices`
+  // (target-point index, -1 if no neighbour) and `sq_distances` (SQUARED euclidean,
+  // +inf if none). Static mode queries search_target_ (PCL KdTreeFLANN, float32);
+  // incremental mode queries dynamic_search_target_.
+  void queryTargetNN(const std::vector<float>& query_xyz,
+                     std::vector<int>& indices,
+                     std::vector<float>& sq_distances);
 
   // Append n new target points + 2DGS attrs. Returns the first new index.
   // Only valid in "incremental" mode.
@@ -270,6 +292,11 @@ protected:
 
   std::vector<int> correspondences_;
   std::vector<float> sq_distances_;
+
+  // EXP-124: flow-derived source->target index map (size == source size, -1 == no
+  // flow corr for that source point). use_flow_corr_ toggles the override.
+  std::vector<int> flow_corr_;
+  bool use_flow_corr_ = false;
 
   ColorMatchingConfig color_matching_config_;
   std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> source_colors_;

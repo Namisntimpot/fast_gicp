@@ -579,8 +579,20 @@ PYBIND11_MODULE(pygicp, m) {
   );
 
   py::class_<LsqRegistration, std::shared_ptr<LsqRegistration>>(m, "LsqRegistration")
-    .def("set_input_target", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) { reg.setInputTarget(eigen2pcl(points)); })
-    .def("set_input_source", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) { reg.setInputSource(eigen2pcl(points)); })
+    .def("set_input_target", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) {
+        // accel P1a: the target KD-tree build (~14 ms) is pure C++/PCL and touches no Python objects.
+        // eigen2pcl() reads the (already-materialised) Eigen matrix first, THEN we release the GIL for
+        // the build, so the frontend's flow worker thread can launch its GPU work concurrently with
+        // ensure_target. Numerically identical — only the GIL is released around a no-Python region.
+        auto cloud = eigen2pcl(points);
+        py::gil_scoped_release release;
+        reg.setInputTarget(cloud);
+    })
+    .def("set_input_source", [] (LsqRegistration& reg, const Eigen::Matrix<double, -1, 3>& points) {
+        auto cloud = eigen2pcl(points);
+        py::gil_scoped_release release;
+        reg.setInputSource(cloud);
+    })
     .def("swap_source_and_target", &LsqRegistration::swapSourceAndTarget)
     .def("set_lsq_optimizer_type", [] (LsqRegistration& reg, const std::string& name) { reg.setLSQOptimizerType(optimizer_type(name)); })
     .def("set_max_iterations", [] (LsqRegistration& reg, int n) { reg.setMaximumIterations(n); })
@@ -739,10 +751,19 @@ PYBIND11_MODULE(pygicp, m) {
     .def("clear_multi_restart_initial_guesses", &LsqRegistration::clearMultiRestartInitialGuesses)
     .def("get_fitness_score", [] (LsqRegistration& reg, const double max_range) { return reg.getFitnessScore(max_range); })
     .def("align",
-      [] (LsqRegistration& reg, const Eigen::Matrix4f& initial_guess) { 
+      [] (LsqRegistration& reg, const Eigen::Matrix4f& initial_guess) {
         pcl::PointCloud<pcl::PointXYZ> aligned;
-        reg.align(aligned, initial_guess);
-        return reg.getFinalTransformation();
+        Eigen::Matrix4f result;
+        {
+          // accel WS2: the dense GICP solve is pure C++/Eigen and touches no Python objects,
+          // so release the GIL for its duration. This lets the frontend's prefetch/pipeline
+          // worker threads run concurrently with the (CPU-bound, 73-130 ms) solve. Numerically
+          // identical to before — only the GIL is released around a no-Python region.
+          py::gil_scoped_release release;
+          reg.align(aligned, initial_guess);
+          result = reg.getFinalTransformation();
+        }
+        return result;
       }, py::arg("initial_guess") = Eigen::Matrix4f::Identity()
     )
   ;
@@ -809,8 +830,18 @@ PYBIND11_MODULE(pygicp, m) {
     .def("calculate_target_covariance_withz", &FastGICP::calculateTargetCovarianceWithZ)
     .def("calculate_target_covariance_with_filter", &FastGICP::calculateTargetCovarianceWithFilter)
     .def("get_source_correspondence", [] (FastGICP& gicp){
-    	return py::make_tuple(py::array(gicp.getSourceSize(), gicp.getSourceCorrespondences().data()), 
+    	return py::make_tuple(py::array(gicp.getSourceSize(), gicp.getSourceCorrespondences().data()),
     				py::array(gicp.getSourceSize(), gicp.getSourceSqDistances().data()));
+    })
+    // accel: 1-NN of query points (Nx3) into the CURRENT target tree. Lets the dense-flow
+    // correspondence builder reuse this tree instead of building a 2nd scipy cKDTree over the
+    // same target points. Returns (indices int32 [-1=none], sq_distances float32 [+inf=none]).
+    .def("query_target_nn", [] (FastGICP& gicp, py::array query){
+    	const auto q = numpy_to_float_list(query);
+    	std::vector<int> idx; std::vector<float> d2;
+    	gicp.queryTargetNN(q, idx, d2);
+    	return py::make_tuple(py::array(idx.size(), idx.data()),
+    			      py::array(d2.size(), d2.data()));
     })
     .def("set_source_covariances_fromqs", [] (FastGICP& gicp, py::array rotationsq, py::array scales){
     	if(py::len(rotationsq)/4!=py::len(scales)/3){ std::cerr<<"[set_source_covariances_fromqs] qs size not matched" <<std::endl; return;}
@@ -897,6 +928,20 @@ PYBIND11_MODULE(pygicp, m) {
     .def("get_live_target_count", &FastGICP::getLiveTargetCount)
     .def("get_total_target_count", &FastGICP::getTotalTargetCount)
     .def("get_target_tombstone_ratio", &FastGICP::getTargetTombstoneRatio)
+    // ---- EXP-124: dense-optical-flow correspondences ---------------------
+    .def("set_flow_correspondences", [] (FastGICP& gicp, py::array src_idx, py::array tgt_idx) {
+      const auto si = src_idx.cast<std::vector<int>>();
+      const auto ti = tgt_idx.cast<std::vector<int>>();
+      gicp.setFlowCorrespondences(si, ti);
+    },
+         py::arg("src_idx"), py::arg("tgt_idx"),
+         "Override NN data association with a flow-derived source->target index map. "
+         "Call AFTER set_input_source and BEFORE align. Matched points bypass the "
+         "max_correspondence_distance gate.")
+    .def("set_use_flow_correspondences", &FastGICP::setUseFlowCorrespondences,
+         py::arg("use_flow"),
+         "Toggle the flow-correspondence override (default false = standard NN GICP).")
+    .def("clear_flow_correspondences", &FastGICP::clearFlowCorrespondences)
   ;
 
   py::class_<FastVGICP, FastGICP, std::shared_ptr<FastVGICP>>(m, "FastVGICP")
