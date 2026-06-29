@@ -2,6 +2,7 @@
 #define FAST_GICP_FAST_GICP_IMPL_HPP
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <limits>
@@ -416,19 +417,39 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   sq_distances.assign(n, std::numeric_limits<float>::infinity());
   const bool use_dynamic = (target_kdtree_mode_ == "incremental") && (dynamic_search_target_ != nullptr);
   if (!use_dynamic && !search_target_) return;
+  // CANONICAL_TIEBREAK (default OFF): match update_correspondences so the flow query resolves the
+  // SAME physical target point in nanoflann (incremental) and PCL (static) at near-ties.
+  static const bool kCanonicalTie = []() { const char* e = std::getenv("CANONICAL_TIEBREAK"); return e && std::atoi(e) != 0; }();
+  static const int kTieK = []() { const char* e = std::getenv("CANONICAL_TIE_K"); return e ? std::max(2, std::atoi(e)) : 4; }();
+  const int kq = kCanonicalTie ? kTieK : 1;
 #pragma omp parallel for num_threads(num_threads_) schedule(guided, 64)
   for (int i = 0; i < n; i++) {
     PointTarget pt;
     pt.x = query_xyz[3 * i + 0];
     pt.y = query_xyz[3 * i + 1];
     pt.z = query_xyz[3 * i + 2];
-    std::vector<int> k_idx(1);
-    std::vector<float> k_d2(1);
-    int found = use_dynamic ? dynamic_search_target_->nearestKSearch(pt, 1, k_idx, k_d2)
-                            : search_target_->nearestKSearch(pt, 1, k_idx, k_d2);
+    std::vector<int> k_idx(kq);
+    std::vector<float> k_d2(kq);
+    int found = use_dynamic ? dynamic_search_target_->nearestKSearch(pt, kq, k_idx, k_d2)
+                            : search_target_->nearestKSearch(pt, kq, k_idx, k_d2);
     if (found > 0) {
-      indices[i] = k_idx[0];
-      sq_distances[i] = k_d2[0];
+      int best = k_idx[0]; float best_d2 = k_d2[0];
+      if (kCanonicalTie && best >= 0) {
+        const Eigen::Vector3d q(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
+        double best_d2d = std::numeric_limits<double>::max();
+        float bx = 0.f, by = 0.f, bz = 0.f; best = -1;
+        for (int c = 0; c < found; c++) {
+          const int idx = k_idx[c]; if (idx < 0) continue;
+          const auto& p = target_->at(idx);
+          const Eigen::Vector3d tp(static_cast<double>(p.x), static_cast<double>(p.y), static_cast<double>(p.z));
+          const double d2d = (q - tp).squaredNorm();
+          bool take = d2d < best_d2d;
+          if (!take && d2d == best_d2d) take = (p.x < bx || (p.x == bx && (p.y < by || (p.y == by && p.z < bz))));
+          if (take) { best_d2d = d2d; best = idx; best_d2 = k_d2[c]; bx = p.x; by = p.y; bz = p.z; }
+        }
+      }
+      indices[i] = best;
+      sq_distances[i] = best_d2;
     }
   }
 }
@@ -600,7 +621,17 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   mahalanobis_.resize(input_->size());
 
   const bool use_color = color_matching_ready();
-  const int candidate_count = use_color ? std::max(1, color_matching_config_.geometric_candidate_count) : 1;
+  // CANONICAL_TIEBREAK (env, default OFF -> byte-identical): two EXACT NN methods (nanoflann vs
+  // PCL FLANN) can only disagree on near-ties (target points within float-eps of equidistant from
+  // a query); they then pick different equidistant points -> chaotic divergence on long seqs (the
+  // INCR_KD-vs-PCL 688mm). Fix: fetch the K nearest (both libs return the SAME K) and, among
+  // candidates whose sq_dist is within tie_eps of the minimum, pick the one with the
+  // lexicographically smallest target point (x,y,z) -- index/library-agnostic -> identical choice
+  // in both the incremental (nanoflann) and static (PCL) trees. Cost ~0 off near-ties.
+  static const bool kCanonicalTie = []() { const char* e = std::getenv("CANONICAL_TIEBREAK"); return e && std::atoi(e) != 0; }();
+  static const int kTieK = []() { const char* e = std::getenv("CANONICAL_TIE_K"); return e ? std::max(2, std::atoi(e)) : 4; }();
+  const int candidate_count = use_color ? std::max(1, color_matching_config_.geometric_candidate_count)
+                                        : (kCanonicalTie ? kTieK : 1);
   std::vector<int> k_indices(candidate_count);
   std::vector<float> k_sq_dists(candidate_count);
 
@@ -656,6 +687,32 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
         best_score = score;
         best_sq_dist = k_sq_dists[candidate];
         best_index = k_indices[candidate];
+      }
+    }
+
+    // CANONICAL tie-break (geometry only): the nanoflann(incremental) vs PCL(static) disagreement
+    // is pure float32 rounding in the per-candidate squared-distance. RE-RANK the K candidates by
+    // a float64 recompute of ||pt - target|| from the SAME query pt and SAME target point -> both
+    // libraries compute the identical double value and pick the identical true-nearest. This is
+    // accuracy-OPTIMAL (picks the genuine NN, no lexicographic spatial bias) and deterministic.
+    // Exact float64 ties (astronomically rare) fall back to the lexicographically smallest point.
+    if (kCanonicalTie && !use_color && best_index >= 0) {
+      const Eigen::Vector3d q(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
+      double best_d2d = std::numeric_limits<double>::max();
+      const float gate2 = corr_dist_threshold_ * corr_dist_threshold_;
+      float bx = 0.f, by = 0.f, bz = 0.f;
+      for (int candidate = 0; candidate < (int)k_indices.size(); candidate++) {
+        if (k_sq_dists[candidate] >= gate2) continue;
+        const int idx = k_indices[candidate];
+        if (idx < 0) continue;
+        const auto& p = target_->at(idx);
+        const Eigen::Vector3d tp(static_cast<double>(p.x), static_cast<double>(p.y), static_cast<double>(p.z));
+        const double d2d = (q - tp).squaredNorm();
+        bool take = d2d < best_d2d;
+        if (!take && d2d == best_d2d) {  // exact-tie canonical fallback
+          take = (p.x < bx || (p.x == bx && (p.y < by || (p.y == by && p.z < bz))));
+        }
+        if (take) { best_d2d = d2d; best_index = idx; best_sq_dist = k_sq_dists[candidate]; bx = p.x; by = p.y; bz = p.z; }
       }
     }
 
