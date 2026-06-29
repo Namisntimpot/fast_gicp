@@ -38,7 +38,34 @@ class NanoflannDynamicSearch {
     bool kdtree_get_bbox(BBOX&) const { return false; }
   };
 
-  using DistanceT = nanoflann::L2_Simple_Adaptor<float, DatasetAdaptor>;
+  // Double-precision L2 metric: promotes the float coords to double BEFORE subtracting, so the NN
+  // distance ordering is computed entirely in float64. This makes the K=1 nearest the TRUE
+  // float64-nearest — identical to what the CANONICAL_TIEBREAK re-rank picks — WITHOUT the K>=2
+  // search + per-candidate re-rank cost. float32 distance rounding at near-ties (equidistant target
+  // points) is what made plain nanoflann pick wrong correspondences (room/outer-wall overlap on the
+  // long zhiyuan_all); the double subtraction removes the ambiguity. Point storage stays float
+  // (no memory cost); only the ~3 subtract/square ops per node visit run in double.
+  struct L2_Double_Adaptor {
+    using ElementType = float;
+    using DistanceType = double;
+    const DatasetAdaptor& data_source;
+    explicit L2_Double_Adaptor(const DatasetAdaptor& ds) : data_source(ds) {}
+    inline DistanceType evalMetric(const float* a, const std::uint32_t b_idx, std::size_t size) const {
+      DistanceType result = DistanceType();
+      for (std::size_t i = 0; i < size; ++i) {
+        const double diff = static_cast<double>(a[i]) - static_cast<double>(data_source.kdtree_get_pt(b_idx, i));
+        result += diff * diff;
+      }
+      return result;
+    }
+    template <typename U, typename V>
+    inline DistanceType accum_dist(const U a, const V b, const std::size_t) const {
+      const double diff = static_cast<double>(a) - static_cast<double>(b);
+      return diff * diff;
+    }
+  };
+
+  using DistanceT = L2_Double_Adaptor;
   using TreeT = nanoflann::KDTreeSingleIndexDynamicAdaptor<DistanceT, DatasetAdaptor, 3, std::uint32_t>;
 
   NanoflannDynamicSearch() : adaptor_{this} {}
@@ -128,14 +155,14 @@ class NanoflannDynamicSearch {
     if (!tree_ || live_count_ == 0) return 0;
     const float query[3] = {point.x, point.y, point.z};
     std::vector<std::uint32_t> out_idx(k);
-    std::vector<float> out_dist(k);
-    nanoflann::KNNResultSet<float, std::uint32_t> result(static_cast<std::size_t>(k));
+    std::vector<double> out_dist(k);  // tree DistanceType is double (L2_Double_Adaptor)
+    nanoflann::KNNResultSet<double, std::uint32_t> result(static_cast<std::size_t>(k));
     result.init(out_idx.data(), out_dist.data());
     tree_->findNeighbors(result, query);
     const int found = static_cast<int>(result.size());
     for (int i = 0; i < found; ++i) {
       indices[i] = static_cast<int>(out_idx[i]);
-      sq_dists[i] = out_dist[i];
+      sq_dists[i] = static_cast<float>(out_dist[i]);  // float64 dist -> float for the GICP gate/weight
     }
     return found;
   }

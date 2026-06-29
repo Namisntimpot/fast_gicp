@@ -421,6 +421,10 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   // SAME physical target point in nanoflann (incremental) and PCL (static) at near-ties.
   static const bool kCanonicalTie = []() { const char* e = std::getenv("CANONICAL_TIEBREAK"); return e && std::atoi(e) != 0; }();
   static const int kTieK = []() { const char* e = std::getenv("CANONICAL_TIE_K"); return e ? std::max(2, std::atoi(e)) : 4; }();
+  // LAZY (CANONICAL_LAZY=1, default OFF): skip the f64 re-rank when the nearest is unambiguous; see
+  // update_correspondences for the rationale. Bit-identical to always-f64.
+  static const bool kCanonicalLazy = []() { const char* e = std::getenv("CANONICAL_LAZY"); return e && std::atoi(e) != 0; }();
+  static const float kCanonicalLazyEps = []() { const char* e = std::getenv("CANONICAL_LAZY_EPS"); return e ? std::max(0.f, (float)std::atof(e)) : 1e-5f; }();
   const int kq = kCanonicalTie ? kTieK : 1;
 #pragma omp parallel for num_threads(num_threads_) schedule(guided, 64)
   for (int i = 0; i < n; i++) {
@@ -434,7 +438,9 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
                             : search_target_->nearestKSearch(pt, kq, k_idx, k_d2);
     if (found > 0) {
       int best = k_idx[0]; float best_d2 = k_d2[0];
-      if (kCanonicalTie && best >= 0) {
+      bool do_rerank = (found >= 2);
+      if (do_rerank && kCanonicalLazy && (k_d2[1] - k_d2[0]) > kCanonicalLazyEps * (k_d2[0] + 1e-12f)) do_rerank = false;
+      if (kCanonicalTie && best >= 0 && do_rerank) {
         const Eigen::Vector3d q(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
         double best_d2d = std::numeric_limits<double>::max();
         float bx = 0.f, by = 0.f, bz = 0.f; best = -1;
@@ -630,6 +636,13 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
   // in both the incremental (nanoflann) and static (PCL) trees. Cost ~0 off near-ties.
   static const bool kCanonicalTie = []() { const char* e = std::getenv("CANONICAL_TIEBREAK"); return e && std::atoi(e) != 0; }();
   static const int kTieK = []() { const char* e = std::getenv("CANONICAL_TIE_K"); return e ? std::max(2, std::atoi(e)) : 4; }();
+  // LAZY (CANONICAL_LAZY=1, default OFF -> always-f64 i.e. byte-identical to the committed canon):
+  // the float32-NN vs float64-NN choice can ONLY differ at near-ties (top-two candidate sq-dists
+  // within float32 rounding). When the nearest is unambiguous (clear gap to the 2nd), nanoflann's
+  // k[0] already IS the true nearest == PCL's pick, so the f64 re-rank is a no-op. Skip it there ->
+  // pay the f64 loop only on the rare near-tie. Bit-identical to always-f64; recovers most of the tax.
+  static const bool kCanonicalLazy = []() { const char* e = std::getenv("CANONICAL_LAZY"); return e && std::atoi(e) != 0; }();
+  static const float kCanonicalLazyEps = []() { const char* e = std::getenv("CANONICAL_LAZY_EPS"); return e ? std::max(0.f, (float)std::atof(e)) : 1e-5f; }();
   const int candidate_count = use_color ? std::max(1, color_matching_config_.geometric_candidate_count)
                                         : (kCanonicalTie ? kTieK : 1);
   std::vector<int> k_indices(candidate_count);
@@ -697,9 +710,17 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
     // accuracy-OPTIMAL (picks the genuine NN, no lexicographic spatial bias) and deterministic.
     // Exact float64 ties (astronomically rare) fall back to the lexicographically smallest point.
     if (kCanonicalTie && !use_color && best_index >= 0) {
+      const float gate2 = corr_dist_threshold_ * corr_dist_threshold_;
+      // LAZY: skip the f64 re-rank when the nearest is unambiguous (2nd candidate out of gate, or a
+      // clear gap to it). best_index here is k_indices[0] (sorted -> the in-gate min), the true nearest.
+      bool do_rerank = true;
+      if (kCanonicalLazy && k_sq_dists.size() >= 2) {
+        const float d0 = k_sq_dists[0], d1 = k_sq_dists[1];
+        if (d1 >= gate2 || (d1 - d0) > kCanonicalLazyEps * (d0 + 1e-12f)) do_rerank = false;
+      }
+      if (do_rerank) {
       const Eigen::Vector3d q(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
       double best_d2d = std::numeric_limits<double>::max();
-      const float gate2 = corr_dist_threshold_ * corr_dist_threshold_;
       float bx = 0.f, by = 0.f, bz = 0.f;
       for (int candidate = 0; candidate < (int)k_indices.size(); candidate++) {
         if (k_sq_dists[candidate] >= gate2) continue;
@@ -714,6 +735,7 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
         }
         if (take) { best_d2d = d2d; best_index = idx; best_sq_dist = k_sq_dists[candidate]; bx = p.x; by = p.y; bz = p.z; }
       }
+      }  // do_rerank
     }
 
     sq_distances_[i] = best_sq_dist;
